@@ -1,21 +1,24 @@
-import _init_path
+from tools import _init_path
 import argparse
 import datetime
 import glob
 import os
 import re
 import time
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 import torch
 from tensorboardX import SummaryWriter
 
-from eval_utils import eval_utils
+from tools.eval_utils import eval_utils
 from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_file
 from pcdet.datasets import build_dataloader
 from pcdet.models import build_network
 from pcdet.utils import common_utils
+from pcdet.models import load_data_to_gpu
+from fvcore.nn import FlopCountAnalysis, parameter_count_table
 
 
 def parse_config():
@@ -60,7 +63,7 @@ def eval_single_ckpt(model, test_loader, args, eval_output_dir, logger, epoch_id
     model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=dist_test, 
                                 pre_trained_path=args.pretrained_model)
     model.cuda()
-    
+
     # start evaluation
     eval_utils.eval_one_epoch(
         cfg, args, model, test_loader, epoch_id, logger, dist_test=dist_test,
@@ -135,6 +138,11 @@ def repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir
         logger.info('Epoch %s has been evaluated' % cur_epoch_id)
 
 
+global_time = None
+exec_times = []
+module_names = []
+gpu_usage = []
+
 def main():
     args, cfg = parse_config()
 
@@ -194,6 +202,115 @@ def main():
         batch_size=args.batch_size,
         dist=dist_test, workers=args.workers, logger=logger, training=False
     )
+
+    sample = next(iter(test_loader))
+    load_data_to_gpu(sample)
+
+    model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+
+    model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+
+    model.cuda()
+
+    def register_time_hooks(model):
+        def forward_hook(module, input, output):
+            global global_time, exec_times, module_names
+            exec_times.append(time.time() - global_time)
+            module_names.append(str(module.__class__))
+            global_time = time.time()
+
+        handles = []
+        for module in model.modules():
+            handle = module.register_forward_hook(forward_hook)
+            handles.append(handle)
+        return handles
+    
+    def log_time(model):
+        global module_names, exec_times
+        for module, t in zip(model.modules(), exec_times):
+            logger.info(f"{module.__class__}: {t} seconds")
+
+        module_time_pairs = list(zip(module_names, exec_times))
+
+        sorted_module_time_pairs = sorted(module_time_pairs, key=lambda x: x[1], reverse=True)
+
+        top_twenty = sorted_module_time_pairs[:20]
+            
+        for module, t in top_twenty:
+            logger.info(f"{module}: {t} seconds")
+    
+    class MemoryUsageMonitor:
+        global module_names, gpu_usage
+        def __init__(self):
+            self.reset()
+
+        def reset(self):
+            self.memory_allocated_before = 0
+            self.memory_allocated_after = 0
+
+        def pre_forward_hook(self, module, input):
+            self.memory_allocated_before = torch.cuda.memory_allocated()
+
+        def forward_hook(self, module, input, output):
+            self.memory_allocated_after = torch.cuda.memory_allocated()
+            module_names.append(str(module.__class__))
+            gpu_usage.append(self.memory_allocated_after - self.memory_allocated_before)
+
+    def register_gpu_hooks(model, monitor):
+        for layer in model.modules():
+            layer.register_forward_pre_hook(monitor.pre_forward_hook)
+            layer.register_forward_hook(monitor.forward_hook)
+
+    def log_gpu(model):
+        global module_names, gpu_usage
+        for module, g in zip(model.modules(), gpu_usage):
+            logger.info(f"{module.__class__}: {g / 1024**2} MB")
+
+        module_gpu_pairs = list(zip(module_names, gpu_usage))
+
+        sorted_module_gpu_pairs = sorted(module_gpu_pairs, key=lambda x: x[1], reverse=True)
+
+        top_twenty = sorted_module_gpu_pairs[:20]
+            
+        for module, t in top_twenty:
+            logger.info(f"{module}: {t} MB")
+
+    model.eval()
+
+    # global global_time, exec_times, module_names, gpu_usage
+
+    # global_time = time.time()
+
+    # monitor = MemoryUsageMonitor()
+    # register_gpu_hooks(model, monitor)
+
+    # register_time_hooks(model)
+
+    logger.info(parameter_count_table(model))
+
+    # model(sample)
+
+    # log_gpu(model)
+
+    # log_time(model)
+
+
+
+    
+
+    # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+    #     with record_function("model_inference"):
+    #         model(sample)
+
+    # logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
+
+    # model(sample)
+
+    # logger.info(take_time_dict)
+
+    exit()
+
+    print(prof.key_averages().table(sort_by="gpu_memory_usage", row_limit=10))
 
     model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
 
