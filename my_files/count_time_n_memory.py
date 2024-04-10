@@ -7,6 +7,7 @@ import re
 import time
 from functools import partial
 from pathlib import Path
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -20,6 +21,14 @@ from pcdet.utils import common_utils
 from pcdet.models import load_data_to_gpu
 from fvcore.nn import FlopCountAnalysis, parameter_count_table
 
+from pytorch_quantization import quant_modules
+from pytorch_quantization.nn.modules import _utils as quant_nn_utils
+from pytorch_quantization import calib
+from pytorch_quantization import nn as quant_nn
+from pytorch_quantization.tensor_quant import QuantDescriptor
+from absl import logging as quant_logging
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 def parse_config():
     parser = argparse.ArgumentParser(description='arg parser')
@@ -203,8 +212,8 @@ def main():
         dist=dist_test, workers=args.workers, logger=logger, training=False
     )
 
-    sample = next(iter(test_loader))
-    load_data_to_gpu(sample)
+    # sample = next(iter(test_loader))
+    # load_data_to_gpu(sample)
 
     model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
 
@@ -275,7 +284,172 @@ def main():
         for module, t in top_twenty:
             logger.info(f"{module}: {t} MB")
 
-    model.eval()
+    # eval_utils.eval_one_epoch(
+    #     cfg, args, model, test_loader, epoch_id, logger, dist_test=False,
+    #     result_dir=eval_output_dir
+    # )
+
+    def initialize(calib_method: str):
+        """
+        This method is used to initialize the default Descriptor for Conv2d activation quantization:
+            1. intput QuantDescriptor: Max or Histogram
+            2. calib_method -> ["max", "histogram"]
+        :param calib_method: ["max", "histogram"]
+        :return: no return value
+        """
+        quant_desc_input = QuantDescriptor(calib_method=calib_method)
+        quant_nn.QuantConv2d.set_default_quant_desc_input(quant_desc_input)
+        quant_nn.QuantMaxPool2d.set_default_quant_desc_input(quant_desc_input)
+        quant_nn.QuantLinear.set_default_quant_desc_input(quant_desc_input)
+        quant_logging.set_verbosity(quant_logging.ERROR)
+
+    def replace_to_quantization_model(model, ignore_layer=None):
+        """
+        Entry point of quantizing the model: this function is used to filter out the ignored layers and initialize the replace map.
+        :param model: model returned from "prepare_model" function
+        :param ignore_layer: layers that we don't want to be quantized
+        :return: no return value
+        """
+        module_dict = {}
+        for entry in quant_modules._DEFAULT_QUANT_MAP:
+            module = getattr(entry.orig_mod, entry.mod_name)
+            module_dict[id(module)] = entry.replace_mod
+        torch_module_find_quant_module(model, module_dict, ignore_layer)
+
+    def transfer_torch_to_quantization(nn_instance, quant_mudule):
+        """
+        This function mainly instanciate the quantized layer,
+        migrate all the attributes of the original layer to the quantized layer,
+        and add the default descriptor to the quantized layer, i.e., how should weight and quantization be quantized.
+        :param nn_instance: original layer
+        :param quant_mudule: corresponding class of the quantized layer
+        :return: no return value
+        """
+        quant_instance = quant_mudule.__new__(quant_mudule)
+        for k, val in vars(nn_instance).items():
+            setattr(quant_instance, k, val)
+
+        def __init__(self):
+            # Return two instances of QuantDescriptor; self.__class__ is the class of quant_instance, E.g.: QuantConv2d
+            quant_desc_input, quant_desc_weight = quant_nn_utils.pop_quant_desc_in_kwargs(self.__class__)
+            if isinstance(self, quant_nn_utils.QuantInputMixin):
+                self.init_quantizer(quant_desc_input)
+                if isinstance(self._input_quantizer._calibrator, calib.HistogramCalibrator):
+                    self._input_quantizer._calibrator._torch_hist = True
+            else:
+                self.init_quantizer(quant_desc_input, quant_desc_weight)
+
+                if isinstance(self._input_quantizer._calibrator, calib.HistogramCalibrator):
+                    self._input_quantizer._calibrator._torch_hist = True
+                    self._weight_quantizer._calibrator._torch_hist = True
+
+        __init__(quant_instance)
+        return quant_instance
+
+    def torch_module_find_quant_module(module, module_dict, ignore_layer):
+        """
+        This is a recursive function that find all modules within the map and also within the model
+        and replace the module to the quantized version by call "transfer_torch_to_quantization" function
+        :param module: The model to be quantized
+        :param module_dict: Replace map, with key is module layer id and value is the class of the quantized layer
+        :param ignore_layer: List of layers to be ignored
+        :return: no return value
+        """
+        if module is None:
+            return
+        
+        for name in module._modules:
+            submodule = module._modules[name]
+            path = name
+            torch_module_find_quant_module(submodule, module_dict, ignore_layer)
+
+            submodule_id = id(type(submodule))
+            if submodule_id in module_dict:
+                ignored = quantization_ignore_match(ignore_layer, path)
+                if ignored:
+                    print(f"Quantization : {path} has ignored.")
+                    continue
+                # substitute the layer with quantized version
+                module._modules[name] = transfer_torch_to_quantization(submodule, module_dict[submodule_id])
+
+    def quantization_ignore_match(ignore_layer, path):
+        """
+        A simple function to determine whether a layer is ignored
+        """
+        if ignore_layer is None:
+            return False
+        if isinstance(ignore_layer, str) or isinstance(ignore_layer, list):
+            if isinstance(ignore_layer, str):
+                ignore_layer = [ignore_layer]
+            if path in ignore_layer:
+                return True
+            for item in ignore_layer:
+                if re.match(item, path):
+                    return True
+        return False
+    
+    def compute_amax(model, device, **kwargs):
+        for name, module in model.named_modules():
+            if isinstance(module, quant_nn.TensorQuantizer):
+                if module._calibrator is not None:
+                    if isinstance(module._calibrator, calib.MaxCalibrator):
+                        module.load_calib_amax()
+                    else:
+                        module.load_calib_amax(**kwargs)
+                    module._amax = module._amax.to(device)
+
+
+    # method parameter designed for "histogram", method in ['entropy', 'mse', 'percentile']
+    def calibrate_model(model, dataloader, device, method):
+        # Collect stats with data flowing
+        collect_stats(model, dataloader, device)
+        # Get dynamic range and compute amax (used in calibration)
+        compute_amax(model, device, method=method)
+
+    def quantize_model(model, ignore_layer=None, calib_method="max"):
+        """
+        This function is used to quantize the model
+        :param model: model returned from "prepare_model" function
+        :param ignore_layer: layers that we don't want to be quantized
+        :return: no return value
+        """
+        initialize(calib_method)
+        replace_to_quantization_model(model, ignore_layer)
+
+    def collect_stats(model, data_loader, num_batch=200):
+        model.eval()
+        for name, module in model.named_modules():
+            if name.endswith('_quantizer'):
+                module.enable_calib()
+                module.disable_quant()
+
+        with torch.no_grad():
+            for i, batch_dict in enumerate(tqdm(data_loader, desc='calibration', total=num_batch+1)):
+                load_data_to_gpu(batch_dict)
+                model(batch_dict)
+                if i > num_batch:
+                    break
+
+        for name, module in model.named_modules():
+            if name.endswith('_quantizer'):
+                module.disable_calib()
+                module.enable_quant()
+
+    quantize_model(model, ignore_layer=None, calib_method="max")
+
+    collect_stats(model, test_loader, 200)
+
+    compute_amax(model, device, method='entropy')
+
+    model.cuda()
+
+    eval_utils.eval_one_epoch(
+        cfg, args, model, test_loader, epoch_id, logger, dist_test=False,
+        result_dir=eval_output_dir
+    )
+
+    logger.info(model)
+
 
     # global global_time, exec_times, module_names, gpu_usage
 
@@ -286,7 +460,7 @@ def main():
 
     # register_time_hooks(model)
 
-    logger.info(parameter_count_table(model))
+    # logger.info(parameter_count_table(model))
 
     # model(sample)
 
