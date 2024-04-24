@@ -205,12 +205,12 @@ def main():
 
     ckpt_dir = args.ckpt_dir if args.ckpt_dir is not None else output_dir / 'ckpt'
 
-    test_set, test_loader, sampler = build_dataloader(
-        dataset_cfg=cfg.DATA_CONFIG,
-        class_names=cfg.CLASS_NAMES,
-        batch_size=args.batch_size,
-        dist=dist_test, workers=args.workers, logger=logger, training=False
-    )
+    # test_set, test_loader, sampler = build_dataloader(
+    #     dataset_cfg=cfg.DATA_CONFIG,
+    #     class_names=cfg.CLASS_NAMES,
+    #     batch_size=args.batch_size,
+    #     dist=dist_test, workers=args.workers, logger=logger, training=False
+    # )
 
     # sample = next(iter(test_loader))
     # load_data_to_gpu(sample)
@@ -487,6 +487,13 @@ def main():
 
             logger.info('Building model...')
 
+            test_set, test_loader, sampler = build_dataloader(
+                dataset_cfg=cfg.DATA_CONFIG,
+                class_names=cfg.CLASS_NAMES,
+                batch_size=args.batch_size,
+                dist=dist_test, workers=args.workers, logger=logger, training=False
+            )
+
             model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
 
             model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
@@ -495,7 +502,7 @@ def main():
 
             logger.info('Model built successfully!')
 
-            logger.info(f"Quantizing model's weight with {num_bits} bits...")
+            logger.info(f"Quantizing model's {quant} with {num_bits} bits...")
             if quant == 'weight':
                 initialize_weight("max", num_bits)
             elif quant == 'input':
@@ -504,12 +511,6 @@ def main():
                 raise ValueError("Invalid quant parameter!")
             logger.info('Replacing module...')
             replace_to_quantization_model(model, ignore_layer)
-            test_set, test_loader, sampler = build_dataloader(
-                dataset_cfg=cfg.DATA_CONFIG,
-                class_names=cfg.CLASS_NAMES,
-                batch_size=args.batch_size,
-                dist=dist_test, workers=args.workers, logger=logger, training=False
-            )
             logger.info('Collecting stats...')
             collect_stats(model, test_loader, 200)
             logger.info('Computing amax...')
