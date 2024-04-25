@@ -299,7 +299,7 @@ def main():
         """
         quant_desc_input = QuantDescriptor(calib_method=calib_method)
         quant_desc_input_self = QuantDescriptor(num_bits=16)
-        quant_nn.QuantConv2d.set_default_quant_desc_input(quant_desc_input_self)
+        quant_nn.QuantConv2d.set_default_quant_desc_input(quant_desc_input)
         quant_nn.QuantMaxPool2d.set_default_quant_desc_input(quant_desc_input)
         quant_nn.QuantLinear.set_default_quant_desc_input(quant_desc_input)
         quant_logging.set_verbosity(quant_logging.ERROR)
@@ -432,6 +432,16 @@ def main():
             if isinstance(module, quant_nn.TensorQuantizer):
                 if module._calibrator is not None:
                     if isinstance(module._calibrator, calib.MaxCalibrator):
+                        module.load_calib_amax(strict=False)
+                    else:
+                        module.load_calib_amax(**kwargs)
+                    module._amax = module._amax.to(device)
+
+    def compute_amax_weight_only(model, device, **kwargs):
+        for name, module in model.named_modules():
+            if name.endswith('_weight_quantizer'):
+                if module._calibrator is not None:
+                    if isinstance(module._calibrator, calib.MaxCalibrator):
                         module.load_calib_amax()
                     else:
                         module.load_calib_amax(**kwargs)
@@ -474,6 +484,24 @@ def main():
                 module.disable_calib()
                 module.enable_quant()
 
+    def collect_stats_weight_only(model, data_loader, num_batch=200):
+        model.eval()
+        for name, module in model.named_modules():
+            if name.endswith('_weight_quantizer'):
+                module.enable_calib()
+                module.disable_quant()
+
+        with torch.no_grad():
+            for i, batch_dict in enumerate(tqdm(data_loader, desc='calibration', total=num_batch+1)):
+                load_data_to_gpu(batch_dict)
+                model(batch_dict)
+                if i > num_batch:
+                    break
+
+        for name, module in model.named_modules():
+            if name.endswith('_weight_quantizer'):
+                module.disable_calib()
+                module.enable_quant()
 
 
     def get_accuracy_graph(ignore_layer=None, quant=None):
@@ -526,8 +554,62 @@ def main():
             logger.info(model)
 
 
-    get_accuracy_graph(ignore_layer=None, quant='weight')
-    get_accuracy_graph(ignore_layer=None, quant='input')
+    # get_accuracy_graph(ignore_layer=None, quant='weight')
+    # get_accuracy_graph(ignore_layer=None, quant='input')
+
+    test_set, test_loader, sampler = build_dataloader(
+        dataset_cfg=cfg.DATA_CONFIG,
+        class_names=cfg.CLASS_NAMES,
+        batch_size=args.batch_size,
+        dist=dist_test, workers=args.workers, logger=logger, training=False
+    )
+
+    model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+
+    model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+
+    model.cuda()
+
+    quantize_model(model, ignore_layer=None, calib_method="max")
+
+    collect_stats_weight_only(model, test_loader, 200)
+
+    compute_amax_weight_only(model, device, method='entropy')
+
+    model.cuda()
+
+    eval_utils.eval_one_epoch(
+        cfg, args, model, test_loader, epoch_id, logger, dist_test=False,
+        result_dir=eval_output_dir
+    )
+
+    logger.info(model)
+
+
+
+
+    # input_amax_list = []
+    # input_name_list = []
+    # weight_amax_list = []
+    # weight_name_list = []
+    # for name, module in model.named_modules():
+    #     if name.endswith('_quantizer'):
+    #         if isinstance(module, quant_nn.TensorQuantizer):
+    #             if module._calibrator is not None:
+    #                 if name.endswith('_input_quantizer'):
+    #                     input_name_list.append(name)
+    #                     input_amax_list.append(module._amax.tolist())
+    #                 elif name.endswith('_weight_quantizer'):
+    #                     weight_name_list.append(name)
+    #                     weight_amax_list.append(module._amax.tolist())
+
+    # logger.info(f"Input amax list: {input_amax_list}")
+    # logger.info(f"Input name list: {input_name_list}")
+    # logger.info(f"Weight amax list: {weight_amax_list}")
+    # logger.info(f"Weight name list: {weight_name_list}")
+
+
+
 
     # quantize_model(model, ignore_layer=None, calib_method="max")
 
