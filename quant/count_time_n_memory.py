@@ -19,14 +19,17 @@ from pcdet.datasets import build_dataloader
 from pcdet.models import build_network
 from pcdet.utils import common_utils
 from pcdet.models import load_data_to_gpu
-from fvcore.nn import FlopCountAnalysis, parameter_count_table
+# from fvcore.nn import FlopCountAnalysis, parameter_count_table
 
 from pytorch_quantization import quant_modules
 from pytorch_quantization.nn.modules import _utils as quant_nn_utils
 from pytorch_quantization import calib
 from pytorch_quantization import nn as quant_nn
 from pytorch_quantization.tensor_quant import QuantDescriptor
+from pytorch_quantization.nn.modules.tensor_quantizer import TensorQuantizer
 from absl import logging as quant_logging
+
+from MyQuantConv2d import MyQuantConv2d
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -147,10 +150,10 @@ def repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir
         logger.info('Epoch %s has been evaluated' % cur_epoch_id)
 
 
-global_time = None
-exec_times = []
-module_names = []
-gpu_usage = []
+# global_time = None
+# exec_times = []
+# module_names = []
+# gpu_usage = []
 
 def main():
     args, cfg = parse_config()
@@ -233,6 +236,7 @@ def main():
             handle = module.register_forward_hook(forward_hook)
             handles.append(handle)
         return handles
+
     
     def log_time(model):
         global module_names, exec_times
@@ -304,6 +308,37 @@ def main():
         quant_nn.QuantLinear.set_default_quant_desc_input(quant_desc_input)
         quant_logging.set_verbosity(quant_logging.ERROR)
 
+    def initialize_unsigned_for_input_and_convtranspose(calib_method: str):
+        """
+        This method is used to initialize the default Descriptor for Conv2d activation quantization:
+            1. intput QuantDescriptor: Max or Histogram
+            2. calib_method -> ["max", "histogram"]
+        :param calib_method: ["max", "histogram"]
+        :return: no return value
+        """
+        quant_desc_input = QuantDescriptor(calib_method=calib_method)
+        quant_desc_input_self = QuantDescriptor(num_bits=8, calib_method=calib_method, unsigned=True)
+        quant_nn.QuantConv2d.set_default_quant_desc_input(quant_desc_input_self)
+        quant_nn.QuantMaxPool2d.set_default_quant_desc_input(quant_desc_input)
+        quant_nn.QuantLinear.set_default_quant_desc_input(quant_desc_input)
+        quant_nn.QuantConvTranspose2d.set_default_quant_desc_input(quant_desc_input_self)
+        quant_logging.set_verbosity(quant_logging.ERROR)
+
+    def initialize_unsigned_for_input(calib_method: str):
+        """
+        This method is used to initialize the default Descriptor for Conv2d activation quantization:
+            1. intput QuantDescriptor: Max or Histogram
+            2. calib_method -> ["max", "histogram"]
+        :param calib_method: ["max", "histogram"]
+        :return: no return value
+        """
+        quant_desc_input = QuantDescriptor(calib_method=calib_method)
+        quant_desc_input_self = QuantDescriptor(calib_method=calib_method, num_bits=8, unsigned=True)
+        quant_nn.QuantConv2d.set_default_quant_desc_input(quant_desc_input_self)
+        quant_nn.QuantMaxPool2d.set_default_quant_desc_input(quant_desc_input)
+        quant_nn.QuantLinear.set_default_quant_desc_input(quant_desc_input)
+        quant_logging.set_verbosity(quant_logging.ERROR)
+
     def initialize_weight(calib_method: str, num_bits: int = 16):
         """
         This method is used to initialize the default Descriptor for Conv2d activation quantization:
@@ -355,6 +390,22 @@ def main():
             module_dict[id(module)] = entry.replace_mod
         torch_module_find_quant_module(model, module_dict, ignore_layer)
 
+    def my_replace_to_quantization_model(model, ignore_layer=None):
+        """
+        Entry point of quantizing the model: this function is used to filter out the ignored layers and initialize the replace map.
+        :param model: model returned from "prepare_model" function
+        :param ignore_layer: layers that we don't want to be quantized
+        :return: no return value
+        """
+        module_dict = {}
+        for entry in quant_modules._DEFAULT_QUANT_MAP:
+            module = getattr(entry.orig_mod, entry.mod_name)
+            if entry.mod_name == 'Conv2d':
+                module_dict[id(module)] = MyQuantConv2d
+            else: 
+                module_dict[id(module)] = entry.replace_mod
+        torch_module_find_quant_module(model, module_dict, ignore_layer)
+
     def transfer_torch_to_quantization(nn_instance, quant_mudule):
         """
         This function mainly instanciate the quantized layer,
@@ -365,8 +416,28 @@ def main():
         :return: no return value
         """
         quant_instance = quant_mudule.__new__(quant_mudule)
+        if isinstance(quant_instance, MyQuantConv2d):
+            for k, val in vars(nn_instance).items():
+                if isinstance(val, tuple):
+                    val = val[0]
+                setattr(quant_instance, k, val)
+            my_activation_descriptor = QuantDescriptor(
+                num_bits=8,
+                unsigned=True
+            )
+            my_weight_descriptor = QuantDescriptor(
+                num_bits=8, 
+                axis=(0), 
+            )
+            my_activation_quantizer = TensorQuantizer(my_activation_descriptor)
+            my_weight_quantizer = TensorQuantizer(my_weight_descriptor)
+            quant_instance._input_quantizer = my_activation_quantizer
+            quant_instance._weight_quantizer = my_weight_quantizer
+            return quant_instance
         for k, val in vars(nn_instance).items():
             setattr(quant_instance, k, val)
+
+        
 
         def __init__(self):
             # Return two instances of QuantDescriptor; self.__class__ is the class of quant_instance, E.g.: QuantConv2d
@@ -465,6 +536,36 @@ def main():
         initialize(calib_method)
         replace_to_quantization_model(model, ignore_layer)
 
+    def quantize_model_unsigned(model, ignore_layer=None, calib_method="max"):
+        """
+        This function is used to quantize the model
+        :param model: model returned from "prepare_model" function
+        :param ignore_layer: layers that we don't want to be quantized
+        :return: no return value
+        """
+        initialize_unsigned_for_input(calib_method)
+        replace_to_quantization_model(model, ignore_layer)
+
+    def quantize_model_unsigned_convtranspose(model, ignore_layer=None, calib_method="max"):
+        """
+        This function is used to quantize the model
+        :param model: model returned from "prepare_model" function
+        :param ignore_layer: layers that we don't want to be quantized
+        :return: no return value
+        """
+        initialize_unsigned_for_input_and_convtranspose(calib_method)
+        replace_to_quantization_model(model, ignore_layer)
+
+    def my_quantize_model(model, ignore_layer=None, calib_method="max"):
+        """
+        This function is used to quantize the model
+        :param model: model returned from "prepare_model" function
+        :param ignore_layer: layers that we don't want to be quantized
+        :return: no return value
+        """
+        initialize(calib_method)
+        my_replace_to_quantization_model(model, ignore_layer)
+
     def collect_stats(model, data_loader, num_batch=200):
         model.eval()
         for name, module in model.named_modules():
@@ -556,7 +657,48 @@ def main():
 
     # get_accuracy_graph(ignore_layer=None, quant='weight')
     # get_accuracy_graph(ignore_layer=None, quant='input')
+    
+    def register_collect_smoothquant_hook(model, data_loader, num_batch=200):
+        model.eval()
+        act_scales = {}
+        weight_scales = {}
 
+        def forward_hook(module, input, name):
+            hidden_dim_act = input[0].shape[1]
+            tensor_act = input[0].view(-1, hidden_dim_act).abs().detach()
+            comming_max_act = torch.max(tensor_act, dim=0)[0].float().cpu()
+            if name not in act_scales:
+                act_scales[name] = comming_max_act
+            else:
+                act_scales[name] = torch.max(act_scales[name], comming_max_act)
+
+            hidden_dim_weight = module.weight.shape[1]
+            tensor_weight = module.weight.view(-1, hidden_dim_weight).abs().detach()
+            comming_max_weight = torch.max(tensor_weight, dim=0)[0].float().cpu()
+            if name not in weight_scales:
+                weight_scales[name] = comming_max_weight
+            else:
+                weight_scales[name] = torch.max(weight_scales[name], comming_max_weight)
+
+
+        hooks = []
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Conv2d):
+                hook = module.register_forward_pre_hook(partial(forward_hook, name=name))
+                hooks.append(hook)
+
+        try:
+            with torch.no_grad():
+                for i, inputs in enumerate(tqdm(data_loader, desc='collecting stats', total=num_batch)):
+                    if i >= num_batch:
+                        break
+                    load_data_to_gpu(inputs)
+                    model(inputs)
+        finally:
+            for h in hooks:
+                h.remove()
+        return act_scales, weight_scales
+    
     test_set, test_loader, sampler = build_dataloader(
         dataset_cfg=cfg.DATA_CONFIG,
         class_names=cfg.CLASS_NAMES,
@@ -564,17 +706,83 @@ def main():
         dist=dist_test, workers=args.workers, logger=logger, training=False
     )
 
+    # test_set, test_loader, sampler = build_dataloader(
+    #     dataset_cfg=cfg.DATA_CONFIG,
+    #     class_names=cfg.CLASS_NAMES,
+    #     batch_size=args.batch_size,
+    #     dist=dist_test, workers=args.workers, logger=logger, training=False
+    # )
+
+    # model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+
+    # model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+
+    # model.cuda()
+
+    # act_scales, weight_scales = register_collect_smoothquant_hook(model, test_loader, 200)
+
+    # scales = {}
+
+    # for name, act_scale, weight_scale in zip(act_scales.keys(), act_scales.values(), weight_scales.values()):
+    #     scale = torch.sqrt(act_scale / weight_scale)
+    #     scales[name] = scale.view(1, -1, 1, 1).to(device)
+
+    def register_smoothquant_act_hook(model, scales):
+        def forward_pre_hook(module, input, name):
+            modified_input = input[0] / scales[name]
+
+            return (modified_input,)
+
+        handles = []
+        for name, module in model.named_modules():
+            if isinstance(module, quant_nn.Conv2d):
+                handle = module.register_forward_pre_hook(partial(forward_pre_hook, name=name))
+                handles.append(handle)
+        return handles
+    
+    def register_smoothquant_weight_hook(model, scales):
+        for name, module in model.named_modules():
+            if isinstance(module, quant_nn.Conv2d):
+                with torch.no_grad():
+                    module.weight *= scales[name]
+
+        return
+    
+    # quantize_model(model, ignore_layer=None, calib_method="max")
+
+    # hooks = register_smoothquant_act_hook(model, scales)
+
+    # register_smoothquant_weight_hook(model, scales)
+
+    # collect_stats(model, test_loader, 200)
+
+    # compute_amax(model, device, method='entropy')
+
+    # model.cuda()
+
+    # eval_utils.eval_one_epoch(
+    #     cfg, args, model, test_loader, epoch_id, logger, dist_test=False,
+    #     result_dir=eval_output_dir
+    # )
+
+    # for h in hooks:
+    #     h.remove()
+
+    # logger.info(model)
+
+    # logger.info('--------Above is the SmoothQuanted model results--------')
+
     model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
 
     model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
 
     model.cuda()
 
-    quantize_model(model, ignore_layer=None, calib_method="max")
+    my_quantize_model(model, ignore_layer=None, calib_method="max")
 
-    collect_stats_weight_only(model, test_loader, 200)
+    # collect_stats(model, test_loader, 200)
 
-    compute_amax_weight_only(model, device, method='entropy')
+    # compute_amax(model, device, method='entropy')
 
     model.cuda()
 
@@ -585,7 +793,85 @@ def main():
 
     logger.info(model)
 
+    logger.info('--------Above is the SmoothQuanted model results--------')
 
+    model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+
+    model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+
+    model.cuda()
+
+    eval_utils.eval_one_epoch(
+        cfg, args, model, test_loader, epoch_id, logger, dist_test=False,
+        result_dir=eval_output_dir
+    )
+
+    logger.info('--------Above is the original model results--------')
+
+    model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+
+    model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+
+    model.cuda()
+
+    quantize_model(model, ignore_layer=None, calib_method="max")
+
+    collect_stats(model, test_loader, 200)
+
+    compute_amax(model, device, method='entropy')
+
+    model.cuda()
+
+    eval_utils.eval_one_epoch(
+        cfg, args, model, test_loader, epoch_id, logger, dist_test=False,
+        result_dir=eval_output_dir
+    )
+
+    logger.info('--------Above is the W8A8 model results--------')
+
+    model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+
+    model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+
+    model.cuda()
+
+    quantize_model_unsigned(model, ignore_layer=None, calib_method="max")
+
+    collect_stats(model, test_loader, 200)
+
+    compute_amax(model, device, method='entropy')
+
+    model.cuda()
+
+    eval_utils.eval_one_epoch(
+        cfg, args, model, test_loader, epoch_id, logger, dist_test=False,
+        result_dir=eval_output_dir
+    )
+
+    logger.info('--------Above is the unsigned activation W8A8 model results--------')
+
+    # model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+
+    # model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+
+    # model.cuda()
+
+    # quantize_model_unsigned_convtranspose(model, ignore_layer=None, calib_method="max")
+
+    # collect_stats(model, test_loader, 200)
+
+    # compute_amax(model, device, method='entropy')
+
+    # model.cuda()
+
+    # eval_utils.eval_one_epoch(
+    #     cfg, args, model, test_loader, epoch_id, logger, dist_test=False,
+    #     result_dir=eval_output_dir
+    # )
+
+    # logger.info('--------Above is the unsigned activation and ConvTranspose2d W8A8 model results--------')
+
+    # logger.info(model)
 
 
     # input_amax_list = []
