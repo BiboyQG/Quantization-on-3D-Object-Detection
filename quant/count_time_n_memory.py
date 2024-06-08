@@ -64,6 +64,8 @@ def parse_config():
 
     np.random.seed(1024)
 
+    torch.manual_seed(4)
+
     if args.set_cfgs is not None:
         cfg_from_list(args.set_cfgs, cfg)
 
@@ -154,6 +156,10 @@ def repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir
 # exec_times = []
 # module_names = []
 # gpu_usage = []
+global my_res, res, quant_res
+my_res = {}
+res = {}
+quant_res = {}
 
 def main():
     args, cfg = parse_config()
@@ -224,6 +230,8 @@ def main():
 
     # model.cuda()
 
+    global my_res, res
+
     def register_time_hooks(model):
         def forward_hook(module, input, output):
             global global_time, exec_times, module_names
@@ -293,6 +301,23 @@ def main():
     #     result_dir=eval_output_dir
     # )
 
+    def initialize_all(calib_method: str, num_bits: int = 16):
+        """
+        This method is used to initialize the default Descriptor for Conv2d activation quantization:
+            1. intput QuantDescriptor: Max or Histogram
+            2. calib_method -> ["max", "histogram"]
+        :param calib_method: ["max", "histogram"]
+        :return: no return value
+        """
+        quant_desc_input = QuantDescriptor(calib_method=calib_method, num_bits=num_bits, unsigned=True)
+        quant_desc_weight = QuantDescriptor(num_bits=num_bits)
+        quant_nn.QuantConv2d.set_default_quant_desc_input(quant_desc_input)
+        quant_nn.QuantMaxPool2d.set_default_quant_desc_input(quant_desc_input)
+        quant_nn.QuantLinear.set_default_quant_desc_input(quant_desc_input)
+        quant_nn.QuantConv2d.set_default_quant_desc_weight(quant_desc_weight)
+        quant_nn.QuantLinear.set_default_quant_desc_weight(quant_desc_weight)
+        quant_logging.set_verbosity(quant_logging.ERROR)
+
     def initialize(calib_method: str):
         """
         This method is used to initialize the default Descriptor for Conv2d activation quantization:
@@ -302,10 +327,12 @@ def main():
         :return: no return value
         """
         quant_desc_input = QuantDescriptor(calib_method=calib_method)
-        quant_desc_input_self = QuantDescriptor(num_bits=16)
+        quant_desc_input_self = QuantDescriptor(num_bits=8, calib_method=calib_method, unsigned=True)
+        # quant_desc_input_self_trans = QuantDescriptor(num_bits=16, calib_method=calib_method, unsigned=True)
         quant_nn.QuantConv2d.set_default_quant_desc_input(quant_desc_input)
         quant_nn.QuantMaxPool2d.set_default_quant_desc_input(quant_desc_input)
         quant_nn.QuantLinear.set_default_quant_desc_input(quant_desc_input)
+        # quant_nn.QuantConvTranspose2d.set_default_quant_desc_input(quant_desc_input_self_trans)
         quant_logging.set_verbosity(quant_logging.ERROR)
 
     def initialize_unsigned_for_input_and_convtranspose(calib_method: str):
@@ -390,7 +417,7 @@ def main():
             module_dict[id(module)] = entry.replace_mod
         torch_module_find_quant_module(model, module_dict, ignore_layer)
 
-    def my_replace_to_quantization_model(model, ignore_layer=None):
+    def valid_replace_to_quantization_model(model, ignore_layer=None, scaling_factor=0.5, act_num_bits=None, weight_num_bits=None):
         """
         Entry point of quantizing the model: this function is used to filter out the ignored layers and initialize the replace map.
         :param model: model returned from "prepare_model" function
@@ -400,11 +427,68 @@ def main():
         module_dict = {}
         for entry in quant_modules._DEFAULT_QUANT_MAP:
             module = getattr(entry.orig_mod, entry.mod_name)
-            if entry.mod_name == 'Conv2d':
-                module_dict[id(module)] = MyQuantConv2d
-            else: 
-                module_dict[id(module)] = entry.replace_mod
-        torch_module_find_quant_module(model, module_dict, ignore_layer)
+            module_dict[id(module)] = entry.replace_mod
+        vali_original_head_torch_module_find_quant_module(model, module_dict, ignore_layer, current_path=None, scaling_factor=scaling_factor, act_num_bits=act_num_bits, weight_num_bits=weight_num_bits)
+    
+    def my_head_replace_to_quantization_model(model, ignore_layer=None, scaling_factor=None, act_num_bits=None, weight_num_bits=None):
+        """
+        Entry point of quantizing the model: this function is used to filter out the ignored layers and initialize the replace map.
+        :param model: model returned from "prepare_model" function
+        :param ignore_layer: layers that we don't want to be quantized
+        :return: no return value
+        """
+        if scaling_factor is None:
+            raise ValueError("Please specify the scaling_factor parameter!")
+        if act_num_bits is None or weight_num_bits is None:
+            raise ValueError("Please specify the num_bits parameter!")
+        module_dict = {}
+        for entry in quant_modules._DEFAULT_QUANT_MAP:
+            module = getattr(entry.orig_mod, entry.mod_name)
+            # if entry.mod_name == 'Conv2d':
+            #     module_dict[id(module)] = MyQuantConv2d
+            # else: 
+            module_dict[id(module)] = entry.replace_mod
+        test_head_torch_module_find_quant_module(model, module_dict, ignore_layer, current_path=None, scaling_factor=scaling_factor, act_num_bits=act_num_bits, weight_num_bits=weight_num_bits)
+
+    def my_original_replace_to_quantization_model(model, ignore_layer=None, scaling_factor=None, act_num_bits=None, weight_num_bits=None):
+        """
+        Entry point of quantizing the model: this function is used to filter out the ignored layers and initialize the replace map.
+        :param model: model returned from "prepare_model" function
+        :param ignore_layer: layers that we don't want to be quantized
+        :return: no return value
+        """
+        if scaling_factor is None:
+            raise ValueError("Please specify the scaling_factor parameter!")
+        if act_num_bits is None or weight_num_bits is None:
+            raise ValueError("Please specify the num_bits parameter!")
+        module_dict = {}
+        for entry in quant_modules._DEFAULT_QUANT_MAP:
+            module = getattr(entry.orig_mod, entry.mod_name)
+            # if entry.mod_name == 'Conv2d':
+            #     module_dict[id(module)] = MyQuantConv2d
+            # else: 
+            module_dict[id(module)] = entry.replace_mod
+        test_original_torch_module_find_quant_module(model, module_dict, ignore_layer, current_path=None, scaling_factor=scaling_factor, act_num_bits=act_num_bits, weight_num_bits=weight_num_bits)
+
+    def my_replace_to_quantization_model(model, ignore_layer=None, scaling_factor=None, act_num_bits=None, weight_num_bits=None):
+        """
+        Entry point of quantizing the model: this function is used to filter out the ignored layers and initialize the replace map.
+        :param model: model returned from "prepare_model" function
+        :param ignore_layer: layers that we don't want to be quantized
+        :return: no return value
+        """
+        if scaling_factor is None:
+            raise ValueError("Please specify the scaling_factor parameter!")
+        if act_num_bits is None or weight_num_bits is None:
+            raise ValueError("Please specify the num_bits parameter!")
+        module_dict = {}
+        for entry in quant_modules._DEFAULT_QUANT_MAP:
+            module = getattr(entry.orig_mod, entry.mod_name)
+            # if entry.mod_name == 'Conv2d':
+            #     module_dict[id(module)] = MyQuantConv2d
+            # else: 
+            module_dict[id(module)] = entry.replace_mod
+        test_torch_module_find_quant_module(model, module_dict, ignore_layer, current_path=None, scaling_factor=scaling_factor, act_num_bits=act_num_bits, weight_num_bits=weight_num_bits)
 
     def transfer_torch_to_quantization(nn_instance, quant_mudule):
         """
@@ -416,28 +500,8 @@ def main():
         :return: no return value
         """
         quant_instance = quant_mudule.__new__(quant_mudule)
-        if isinstance(quant_instance, MyQuantConv2d):
-            for k, val in vars(nn_instance).items():
-                if isinstance(val, tuple):
-                    val = val[0]
-                setattr(quant_instance, k, val)
-            my_activation_descriptor = QuantDescriptor(
-                num_bits=8,
-                unsigned=True
-            )
-            my_weight_descriptor = QuantDescriptor(
-                num_bits=8, 
-                axis=(0), 
-            )
-            my_activation_quantizer = TensorQuantizer(my_activation_descriptor)
-            my_weight_quantizer = TensorQuantizer(my_weight_descriptor)
-            quant_instance._input_quantizer = my_activation_quantizer
-            quant_instance._weight_quantizer = my_weight_quantizer
-            return quant_instance
         for k, val in vars(nn_instance).items():
             setattr(quant_instance, k, val)
-
-        
 
         def __init__(self):
             # Return two instances of QuantDescriptor; self.__class__ is the class of quant_instance, E.g.: QuantConv2d
@@ -455,6 +519,330 @@ def main():
 
         __init__(quant_instance)
         return quant_instance
+    
+    def transfer_test_torch_to_quantization(nn_instance, quant_mudule, act_num_bits=None, weight_num_bits=None):
+        """
+        This function mainly instanciate the quantized layer,
+        migrate all the attributes of the original layer to the quantized layer,
+        and add the default descriptor to the quantized layer, i.e., how should weight and quantization be quantized.
+        :param nn_instance: original layer
+        :param quant_mudule: corresponding class of the quantized layer
+        :return: no return value
+        """
+        quant_instance = quant_mudule.__new__(quant_mudule)
+        for k, val in vars(nn_instance).items():
+            setattr(quant_instance, k, val)
+
+        def __init__(self):
+            # Return two instances of QuantDescriptor; self.__class__ is the class of quant_instance, E.g.: QuantConv2d
+            # quant_desc_input, quant_desc_weight = quant_nn_utils.pop_quant_desc_in_kwargs(self.__class__)
+            quant_desc_input = QuantDescriptor(
+                num_bits=act_num_bits,
+                # unsigned=True
+            )
+            quant_desc_weight = QuantDescriptor(
+                num_bits=weight_num_bits, 
+                axis=(0), 
+            )
+            if isinstance(self, quant_nn_utils.QuantInputMixin):
+                self.init_quantizer(quant_desc_input)
+                if isinstance(self._input_quantizer._calibrator, calib.HistogramCalibrator):
+                    self._input_quantizer._calibrator._torch_hist = True
+            else:
+                self.init_quantizer(quant_desc_input, quant_desc_weight)
+
+                if isinstance(self._input_quantizer._calibrator, calib.HistogramCalibrator):
+                    self._input_quantizer._calibrator._torch_hist = True
+                    self._weight_quantizer._calibrator._torch_hist = True
+
+        __init__(quant_instance)
+        return quant_instance
+    
+    def my_transfer_torch_to_quantization(nn_instance, quant_mudule, scaling_factor=None, act_num_bits=None, weight_num_bits=None):
+        """
+        This function mainly instanciate the quantized layer,
+        migrate all the attributes of the original layer to the quantized layer,
+        and add the default descriptor to the quantized layer, i.e., how should weight and quantization be quantized.
+        :param nn_instance: original layer
+        :param quant_mudule: corresponding class of the quantized layer
+        :return: no return value
+        """
+        if scaling_factor is None:
+            raise ValueError("Please specify the scaling_factor parameter!")
+        if act_num_bits is None or weight_num_bits is None:
+            raise ValueError("Please specify the num_bits parameter!")
+        quant_instance = quant_mudule.__new__(quant_mudule)
+        for k, val in vars(nn_instance).items():
+            if isinstance(val, tuple):
+                val = val[0]
+            setattr(quant_instance, k, val)
+        my_activation_descriptor = QuantDescriptor(
+            num_bits=act_num_bits,
+            # unsigned=True
+        )
+        my_weight_descriptor = QuantDescriptor(
+            num_bits=weight_num_bits, 
+            axis=(0), 
+        )
+        my_activation_quantizer = TensorQuantizer(my_activation_descriptor)
+        my_weight_quantizer = TensorQuantizer(my_weight_descriptor)
+        quant_instance._input_quantizer = my_activation_quantizer
+        quant_instance._weight_quantizer = my_weight_quantizer
+        quant_instance.scaling_factor = scaling_factor
+        return quant_instance
+    
+    def vali_original_head_torch_module_find_quant_module(module, module_dict, ignore_layer, current_path='', scaling_factor=None, act_num_bits=None, weight_num_bits=None):
+        """
+        This is a recursive function that finds all modules within the model
+        and replaces the modules with their quantized versions by calling
+        "transfer_torch_to_quantization" function if conditions are met.
+        :param module: The model to be quantized
+        :param module_dict: Replace map, with key being module layer id and value being the class of the quantized layer
+        :param ignore_layer: List of layers to be ignored
+        :param current_path: Accumulated path of the module names for nested structure tracking
+        :return: no return value
+        """
+        if scaling_factor is None:
+            raise ValueError("Please specify the scaling_factor parameter!")
+
+        if act_num_bits is None or weight_num_bits is None:
+            raise ValueError("Please specify the num_bits parameter!")
+
+        if module is None:
+            return
+
+        for name, submodule in module.named_children():
+            # Update the path for each submodule
+            path = f"{current_path}.{name}" if current_path else name
+            # Recursively process each submodule
+            vali_original_head_torch_module_find_quant_module(submodule, module_dict, ignore_layer, path, scaling_factor, act_num_bits, weight_num_bits)
+
+            submodule_id = id(type(submodule))
+            if submodule_id in module_dict and not quantization_ignore_match(ignore_layer, path):
+                no_list = ['dense_head.heads_list.0.center.1',
+                        'dense_head.heads_list.0.center_z.1',
+                        'dense_head.heads_list.0.dim.1',
+                        'dense_head.heads_list.0.rot.1',
+                        'dense_head.heads_list.0.vel.1',
+                        'dense_head.heads_list.0.hm.0.0',
+                        'dense_head.heads_list.0.hm.1',
+                        'dense_head.heads_list.1.center.1',
+                        'dense_head.heads_list.1.center_z.1',
+                        'dense_head.heads_list.1.dim.1',
+                        'dense_head.heads_list.1.rot.1',
+                        'dense_head.heads_list.1.vel.1',
+                        'dense_head.heads_list.1.hm.0.0',
+                        'dense_head.heads_list.1.hm.1',
+                        'dense_head.heads_list.2.center.1',
+                        'dense_head.heads_list.2.dim.1',
+                        'dense_head.heads_list.2.rot.1',
+                        'dense_head.heads_list.2.vel.1',
+                        'dense_head.heads_list.2.hm.0.0',
+                        'dense_head.heads_list.2.hm.1',
+                        'dense_head.heads_list.3.center.1',
+                        'dense_head.heads_list.3.dim.1',
+                        'dense_head.heads_list.3.vel.1',
+                        'dense_head.heads_list.3.hm.0.0',
+                        'dense_head.heads_list.3.hm.1',
+                        'dense_head.heads_list.4.center.1',
+                        'dense_head.heads_list.4.dim.1',
+                        'dense_head.heads_list.4.vel.1',
+                        'dense_head.heads_list.4.hm.0.0',
+                        'dense_head.heads_list.4.hm.1',
+                        'dense_head.heads_list.5.center.1',
+                        'dense_head.heads_list.5.dim.1',
+                        'dense_head.heads_list.5.vel.1',
+                        'dense_head.heads_list.5.hm.0.0',
+                        'dense_head.heads_list.5.hm.1']
+                # Check if the module is within the specified path and is a Conv2d for special handling
+                if 'dense_head' in path and isinstance(submodule, torch.nn.Conv2d) and path not in no_list or 'backbone_2d' in path and isinstance(submodule, torch.nn.Conv2d):
+                    # module._modules[name] = transfer_test_torch_to_quantization(submodule, quant_nn.Conv2d, act_num_bits, weight_num_bits)
+                    module._modules[name] = my_transfer_torch_to_quantization(submodule, MyQuantConv2d, scaling_factor, act_num_bits, weight_num_bits)
+                # else:
+                #     # General case: replace the submodule with its quantized version
+                #     module._modules[name] = transfer_torch_to_quantization(submodule, module_dict[submodule_id])
+    
+    def test_head_torch_module_find_quant_module(module, module_dict, ignore_layer, current_path='', scaling_factor=None, act_num_bits=None, weight_num_bits=None):
+        """
+        This is a recursive function that finds all modules within the model
+        and replaces the modules with their quantized versions by calling
+        "transfer_torch_to_quantization" function if conditions are met.
+        :param module: The model to be quantized
+        :param module_dict: Replace map, with key being module layer id and value being the class of the quantized layer
+        :param ignore_layer: List of layers to be ignored
+        :param current_path: Accumulated path of the module names for nested structure tracking
+        :return: no return value
+        """
+        if scaling_factor is None:
+            raise ValueError("Please specify the scaling_factor parameter!")
+
+        if act_num_bits is None or weight_num_bits is None:
+            raise ValueError("Please specify the num_bits parameter!")
+
+        if module is None:
+            return
+
+        for name, submodule in module.named_children():
+            # Update the path for each submodule
+            path = f"{current_path}.{name}" if current_path else name
+            # Recursively process each submodule
+            test_head_torch_module_find_quant_module(submodule, module_dict, ignore_layer, path, scaling_factor, act_num_bits, weight_num_bits)
+
+            submodule_id = id(type(submodule))
+            if submodule_id in module_dict and not quantization_ignore_match(ignore_layer, path):
+                no_list = ['dense_head.heads_list.0.center.1',
+                        'dense_head.heads_list.0.center_z.1',
+                        'dense_head.heads_list.0.dim.1',
+                        'dense_head.heads_list.0.rot.1',
+                        'dense_head.heads_list.0.vel.1',
+                        'dense_head.heads_list.0.hm.0.0',
+                        'dense_head.heads_list.0.hm.1',
+                        'dense_head.heads_list.1.center.1',
+                        'dense_head.heads_list.1.center_z.1',
+                        'dense_head.heads_list.1.dim.1',
+                        'dense_head.heads_list.1.rot.1',
+                        'dense_head.heads_list.1.vel.1',
+                        'dense_head.heads_list.1.hm.0.0',
+                        'dense_head.heads_list.1.hm.1',
+                        'dense_head.heads_list.2.center.1',
+                        'dense_head.heads_list.2.dim.1',
+                        'dense_head.heads_list.2.rot.1',
+                        'dense_head.heads_list.2.vel.1',
+                        'dense_head.heads_list.2.hm.0.0',
+                        'dense_head.heads_list.2.hm.1',
+                        'dense_head.heads_list.3.center.1',
+                        'dense_head.heads_list.3.dim.1',
+                        'dense_head.heads_list.3.vel.1',
+                        'dense_head.heads_list.3.hm.0.0',
+                        'dense_head.heads_list.3.hm.1',
+                        'dense_head.heads_list.4.center.1',
+                        'dense_head.heads_list.4.dim.1',
+                        'dense_head.heads_list.4.vel.1',
+                        'dense_head.heads_list.4.hm.0.0',
+                        'dense_head.heads_list.4.hm.1',
+                        'dense_head.heads_list.5.center.1',
+                        'dense_head.heads_list.5.dim.1',
+                        'dense_head.heads_list.5.vel.1',
+                        'dense_head.heads_list.5.hm.0.0',
+                        'dense_head.heads_list.5.hm.1']
+                # Check if the module is within the specified path and is a Conv2d for special handling
+                if 'dense_head' in path and isinstance(submodule, torch.nn.Conv2d) and path not in no_list or 'backbone_2d' in path and isinstance(submodule, torch.nn.Conv2d):
+                    module._modules[name] = my_transfer_torch_to_quantization(submodule, MyQuantConv2d, scaling_factor, act_num_bits, weight_num_bits)
+                else:
+                    # General case: replace the submodule with its quantized version
+                    module._modules[name] = transfer_torch_to_quantization(submodule, module_dict[submodule_id])
+
+    def test_torch_module_find_quant_module(module, module_dict, ignore_layer, current_path='', scaling_factor=None, act_num_bits=None, weight_num_bits=None):
+        """
+        This is a recursive function that finds all modules within the model
+        and replaces the modules with their quantized versions by calling
+        "transfer_torch_to_quantization" function if conditions are met.
+        :param module: The model to be quantized
+        :param module_dict: Replace map, with key being module layer id and value being the class of the quantized layer
+        :param ignore_layer: List of layers to be ignored
+        :param current_path: Accumulated path of the module names for nested structure tracking
+        :return: no return value
+        """
+        if scaling_factor is None:
+            raise ValueError("Please specify the scaling_factor parameter!")
+
+        if act_num_bits is None or weight_num_bits is None:
+            raise ValueError("Please specify the num_bits parameter!")
+
+        if module is None:
+            return
+
+        for name, submodule in module.named_children():
+            # Update the path for each submodule
+            path = f"{current_path}.{name}" if current_path else name
+
+            # Recursively process each submodule
+            test_torch_module_find_quant_module(submodule, module_dict, ignore_layer, path, scaling_factor, act_num_bits, weight_num_bits)
+
+            submodule_id = id(type(submodule))
+            if submodule_id in module_dict and not quantization_ignore_match(ignore_layer, path):
+                # Check if the module is within the specified path and is a Conv2d for special handling
+                if 'backbone_2d' in path and isinstance(submodule, torch.nn.Conv2d):
+                    module._modules[name] = my_transfer_torch_to_quantization(submodule, MyQuantConv2d, scaling_factor, act_num_bits, weight_num_bits)
+                else:
+                    # General case: replace the submodule with its quantized version
+                    module._modules[name] = transfer_torch_to_quantization(submodule, module_dict[submodule_id])
+
+    def test_original_torch_module_find_quant_module(module, module_dict, ignore_layer, current_path='', scaling_factor=None, act_num_bits=None, weight_num_bits=None):
+        """
+        This is a recursive function that finds all modules within the model
+        and replaces the modules with their quantized versions by calling
+        "transfer_torch_to_quantization" function if conditions are met.
+        :param module: The model to be quantized
+        :param module_dict: Replace map, with key being module layer id and value being the class of the quantized layer
+        :param ignore_layer: List of layers to be ignored
+        :param current_path: Accumulated path of the module names for nested structure tracking
+        :return: no return value
+        """
+        if scaling_factor is None:
+            raise ValueError("Please specify the scaling_factor parameter!")
+
+        if act_num_bits is None or weight_num_bits is None:
+            raise ValueError("Please specify the num_bits parameter!")
+
+        if module is None:
+            return
+
+        for name, submodule in module.named_children():
+            # Update the path for each submodule
+            path = f"{current_path}.{name}" if current_path else name
+
+            # Recursively process each submodule
+            test_original_torch_module_find_quant_module(submodule, module_dict, ignore_layer, path, scaling_factor, act_num_bits, weight_num_bits)
+
+            submodule_id = id(type(submodule))
+            if submodule_id in module_dict and not quantization_ignore_match(ignore_layer, path):
+                # # Check if the module is within the specified path and is a Conv2d for special handling
+                # if 'dense_head' in path and isinstance(submodule, torch.nn.Conv2d):
+                #     module._modules[name] = transfer_test_torch_to_quantization(submodule, quant_nn.Conv2d, act_num_bits, weight_num_bits)
+                # else:
+                no_list = ['dense_head.heads_list.0.center.1',
+                        'dense_head.heads_list.0.center_z.1',
+                        'dense_head.heads_list.0.dim.1',
+                        'dense_head.heads_list.0.rot.1',
+                        'dense_head.heads_list.0.vel.1',
+                        'dense_head.heads_list.0.hm.0.0',
+                        'dense_head.heads_list.0.hm.1',
+                        'dense_head.heads_list.1.center.1',
+                        'dense_head.heads_list.1.center_z.1',
+                        'dense_head.heads_list.1.dim.1',
+                        'dense_head.heads_list.1.rot.1',
+                        'dense_head.heads_list.1.vel.1',
+                        'dense_head.heads_list.1.hm.0.0',
+                        'dense_head.heads_list.1.hm.1',
+                        'dense_head.heads_list.2.center.1',
+                        'dense_head.heads_list.2.dim.1',
+                        'dense_head.heads_list.2.rot.1',
+                        'dense_head.heads_list.2.vel.1',
+                        'dense_head.heads_list.2.hm.0.0',
+                        'dense_head.heads_list.2.hm.1',
+                        'dense_head.heads_list.3.center.1',
+                        'dense_head.heads_list.3.dim.1',
+                        'dense_head.heads_list.3.vel.1',
+                        'dense_head.heads_list.3.hm.0.0',
+                        'dense_head.heads_list.3.hm.1',
+                        'dense_head.heads_list.4.center.1',
+                        'dense_head.heads_list.4.dim.1',
+                        'dense_head.heads_list.4.vel.1',
+                        'dense_head.heads_list.4.hm.0.0',
+                        'dense_head.heads_list.4.hm.1',
+                        'dense_head.heads_list.5.center.1',
+                        'dense_head.heads_list.5.dim.1',
+                        'dense_head.heads_list.5.vel.1',
+                        'dense_head.heads_list.5.hm.0.0',
+                        'dense_head.heads_list.5.hm.1']
+                # Check if the module is within the specified path and is a Conv2d for special handling
+                if 'dense_head' in path and isinstance(submodule, torch.nn.Conv2d) and path not in no_list or 'backbone_2d' in path and isinstance(submodule, torch.nn.Conv2d):
+                    module._modules[name] = transfer_test_torch_to_quantization(submodule, quant_nn.Conv2d, act_num_bits, weight_num_bits)
+                    # module._modules[name] = my_transfer_torch_to_quantization(submodule, MyQuantConv2d, scaling_factor, act_num_bits, weight_num_bits)
+                    # module._modules[name] = transfer_torch_to_quantization(submodule, module_dict[submodule_id])
+                    # General case: replace the submodule with its quantized version
+                    # module._modules[name] = transfer_torch_to_quantization(submodule, module_dict[submodule_id])
 
     def torch_module_find_quant_module(module, module_dict, ignore_layer):
         """
@@ -556,7 +944,7 @@ def main():
         initialize_unsigned_for_input_and_convtranspose(calib_method)
         replace_to_quantization_model(model, ignore_layer)
 
-    def my_quantize_model(model, ignore_layer=None, calib_method="max"):
+    def my_quantize_model(model, ignore_layer=None, calib_method="max", scaling_factor=0.5, act_num_bits=None, weight_num_bits=None):
         """
         This function is used to quantize the model
         :param model: model returned from "prepare_model" function
@@ -564,7 +952,37 @@ def main():
         :return: no return value
         """
         initialize(calib_method)
-        my_replace_to_quantization_model(model, ignore_layer)
+        my_replace_to_quantization_model(model, ignore_layer, scaling_factor, act_num_bits, weight_num_bits)
+
+    def my_original_quantize_model(model, ignore_layer=None, calib_method="max", scaling_factor=0.5, act_num_bits=None, weight_num_bits=None):
+        """
+        This function is used to quantize the model
+        :param model: model returned from "prepare_model" function
+        :param ignore_layer: layers that we don't want to be quantized
+        :return: no return value
+        """
+        initialize_all(calib_method, num_bits=16)
+        my_original_replace_to_quantization_model(model, ignore_layer, scaling_factor, act_num_bits, weight_num_bits)
+
+    def my_head_quantize_model(model, ignore_layer=None, calib_method="max", scaling_factor=0.5, act_num_bits=None, weight_num_bits=None):
+        """
+        This function is used to quantize the model
+        :param model: model returned from "prepare_model" function
+        :param ignore_layer: layers that we don't want to be quantized
+        :return: no return value
+        """
+        initialize_all(calib_method, num_bits=8)
+        my_head_replace_to_quantization_model(model, ignore_layer, scaling_factor, act_num_bits, weight_num_bits)
+
+    def vali_quantize_model(model, ignore_layer=None, calib_method="max", scaling_factor=0.5, act_num_bits=None, weight_num_bits=None):
+        """
+        This function is used to quantize the model
+        :param model: model returned from "prepare_model" function
+        :param ignore_layer: layers that we don't want to be quantized
+        :return: no return value
+        """
+        initialize_all(calib_method, num_bits=16)
+        valid_replace_to_quantization_model(model, ignore_layer, scaling_factor, act_num_bits, weight_num_bits)
 
     def collect_stats(model, data_loader, num_batch=200):
         model.eval()
@@ -747,7 +1165,38 @@ def main():
                     module.weight *= scales[name]
 
         return
-    
+
+    def register_collect_my_input_hook(model):
+
+        def forward_hook(module, input, output, name):
+            global my_res
+            my_res[name]=output.detach()
+
+        for name, module in model.named_modules():
+            if isinstance(module, MyQuantConv2d) or isinstance(module, torch.nn.Conv2d):
+                module.register_forward_hook(partial(forward_hook, name=name))
+
+    def register_collect_input_hook(model):
+
+        def forward_hook(module, input, output, name):
+            global res
+            res[name]=output.detach()
+            
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Conv2d):
+                module.register_forward_hook(partial(forward_hook, name=name))
+
+    def register_collect_quant_input_hook(model):
+
+        def forward_hook(module, input, output, name):
+            global quant_res
+            quant_res[name]=output.detach()
+            
+        for name, module in model.named_modules():
+            if isinstance(module, quant_nn.Conv2d) or isinstance(module, torch.nn.Conv2d):
+                module.register_forward_hook(partial(forward_hook, name=name))
+                
+
     # quantize_model(model, ignore_layer=None, calib_method="max")
 
     # hooks = register_smoothquant_act_hook(model, scales)
@@ -772,130 +1221,262 @@ def main():
 
     # logger.info('--------Above is the SmoothQuanted model results--------')
 
-    model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+    def get_l1_loss():
+        my_model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
 
-    model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+        my_model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
 
-    model.cuda()
+        my_model.cuda()
 
-    my_quantize_model(model, ignore_layer=None, calib_method="max")
+        vali_quantize_model(my_model, ignore_layer=None, calib_method="max", scaling_factor=0.5, act_num_bits=8, weight_num_bits=8)
 
-    # collect_stats(model, test_loader, 200)
+        register_collect_my_input_hook(my_model)
 
-    # compute_amax(model, device, method='entropy')
+        with torch.no_grad():
+            for i, batch_dict in enumerate(tqdm(test_loader, desc='calibration', total=1)):
+                load_data_to_gpu(batch_dict)
+                my_model(batch_dict)
+                break
 
-    model.cuda()
+        # logger.info(my_model)
 
-    eval_utils.eval_one_epoch(
-        cfg, args, model, test_loader, epoch_id, logger, dist_test=False,
-        result_dir=eval_output_dir
-    )
+        # logger.info('--------Above is the SmoothQuanted model results--------')
 
-    logger.info(model)
+        model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
 
-    logger.info('--------Above is the SmoothQuanted model results--------')
+        model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
 
-    model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+        model.cuda()
 
-    model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+        register_collect_input_hook(model)
 
-    model.cuda()
+        with torch.no_grad():
+            for i, batch_dict in enumerate(tqdm(test_loader, desc='calibration', total=1)):
+                load_data_to_gpu(batch_dict)
+                model(batch_dict)
+                break
 
-    eval_utils.eval_one_epoch(
-        cfg, args, model, test_loader, epoch_id, logger, dist_test=False,
-        result_dir=eval_output_dir
-    )
+        for key in my_res.keys():
+            logger.info(f'name: {key}, l1loss: {torch.nn.L1Loss()(my_res[key], res[key]).item()}') 
 
-    logger.info('--------Above is the original model results--------')
+        logger.info('--------Above is the l1loss between final model and the original one--------')
 
-    model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+        model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
 
-    model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+        model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
 
-    model.cuda()
+        model.cuda()
 
-    quantize_model(model, ignore_layer=None, calib_method="max")
+        quantize_model(model, ignore_layer=None, calib_method="max")
 
-    collect_stats(model, test_loader, 200)
+        register_collect_quant_input_hook(model)
 
-    compute_amax(model, device, method='entropy')
+        # logger.info(model)
 
-    model.cuda()
+        with torch.no_grad():
+            for i, batch_dict in enumerate(tqdm(test_loader, desc='calibration', total=1)):
+                load_data_to_gpu(batch_dict)
+                model(batch_dict)
+                break
 
-    eval_utils.eval_one_epoch(
-        cfg, args, model, test_loader, epoch_id, logger, dist_test=False,
-        result_dir=eval_output_dir
-    )
+        model.cuda()
 
-    logger.info('--------Above is the W8A8 model results--------')
+        for key in my_res.keys():
+            logger.info(f'name: {key}, l1loss: {torch.nn.L1Loss()(quant_res[key], res[key]).item()}') 
 
-    model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+        exit()
 
-    model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+    # get_l1_loss()
 
-    model.cuda()
+    def evaluate_with_scale():
+        scale_list = torch.arange(0.1, 1, 0.05)
+        for scale in scale_list:
+            my_model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
 
-    quantize_model_unsigned(model, ignore_layer=None, calib_method="max")
+            my_model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
 
-    collect_stats(model, test_loader, 200)
+            my_model.cuda()
 
-    compute_amax(model, device, method='entropy')
+            my_quantize_model(my_model, ignore_layer=None, calib_method="max", scaling_factor=scale)
 
-    model.cuda()
+            collect_stats(my_model, test_loader, 200)
 
-    eval_utils.eval_one_epoch(
-        cfg, args, model, test_loader, epoch_id, logger, dist_test=False,
-        result_dir=eval_output_dir
-    )
+            compute_amax(my_model, device, method='entropy')
 
-    logger.info('--------Above is the unsigned activation W8A8 model results--------')
+            my_model.cuda()
 
-    # model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+            eval_utils.eval_one_epoch(
+                cfg, args, my_model, test_loader, epoch_id, logger, dist_test=False,
+                result_dir=eval_output_dir
+            )
 
-    # model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+            logger.info(my_model)
 
-    # model.cuda()
+            logger.info(f'********Above is the results if scaling factor = {scale.item()}********')
 
-    # quantize_model_unsigned_convtranspose(model, ignore_layer=None, calib_method="max")
+    # evaluate_with_scale()
 
-    # collect_stats(model, test_loader, 200)
+    def evaluate_with_bits():
+        num_bits_list = [16, 8, 4, 3, 2]
+        for act_num_bits in num_bits_list:
+            for weight_num_bits in num_bits_list:
+                my_model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
 
-    # compute_amax(model, device, method='entropy')
+                my_model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
 
-    # model.cuda()
-
-    # eval_utils.eval_one_epoch(
-    #     cfg, args, model, test_loader, epoch_id, logger, dist_test=False,
-    #     result_dir=eval_output_dir
-    # )
-
-    # logger.info('--------Above is the unsigned activation and ConvTranspose2d W8A8 model results--------')
-
-    # logger.info(model)
-
-
-    # input_amax_list = []
-    # input_name_list = []
-    # weight_amax_list = []
-    # weight_name_list = []
-    # for name, module in model.named_modules():
-    #     if name.endswith('_quantizer'):
-    #         if isinstance(module, quant_nn.TensorQuantizer):
-    #             if module._calibrator is not None:
-    #                 if name.endswith('_input_quantizer'):
-    #                     input_name_list.append(name)
-    #                     input_amax_list.append(module._amax.tolist())
-    #                 elif name.endswith('_weight_quantizer'):
-    #                     weight_name_list.append(name)
-    #                     weight_amax_list.append(module._amax.tolist())
-
-    # logger.info(f"Input amax list: {input_amax_list}")
-    # logger.info(f"Input name list: {input_name_list}")
-    # logger.info(f"Weight amax list: {weight_amax_list}")
-    # logger.info(f"Weight name list: {weight_name_list}")
+                my_model.cuda()
 
 
 
+                my_quantize_model(my_model, ignore_layer=None, calib_method="max", act_num_bits=act_num_bits, weight_num_bits=weight_num_bits)
+
+                collect_stats(my_model, test_loader, 200)
+
+                compute_amax(my_model, device, method='entropy')
+
+                my_model.cuda()
+
+                eval_utils.eval_one_epoch(
+                    cfg, args, my_model, test_loader, epoch_id, logger, dist_test=False,
+                    result_dir=eval_output_dir
+                )
+
+                logger.info(my_model)
+
+                logger.info(f'********Above is the results if activation bits = {act_num_bits} and weight bits = {weight_num_bits}********')
+
+    def evaluate_with_original_bits():
+        
+        my_model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+
+        my_model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+
+        my_model.cuda()
+
+        my_original_quantize_model(my_model, ignore_layer=None, calib_method="max", scaling_factor=0.5, act_num_bits=8, weight_num_bits=8)
+
+        collect_stats(my_model, test_loader, 200)
+
+        compute_amax(my_model, device, method='entropy')
+
+        my_model.cuda()
+
+        eval_utils.eval_one_epoch(
+            cfg, args, my_model, test_loader, epoch_id, logger, dist_test=False,
+            result_dir=eval_output_dir
+        )
+
+        logger.info(my_model)
+
+    evaluate_with_original_bits()
+
+    def evaluate_final_model():
+        my_model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+
+        my_model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+
+        my_model.cuda()
+
+        my_head_quantize_model(my_model, ignore_layer=None, calib_method="max", scaling_factor=0.5, act_num_bits=8, weight_num_bits=8)
+
+        collect_stats(my_model, test_loader, 200)
+
+        compute_amax(my_model, device, method='entropy')
+
+        my_model.cuda()
+
+        eval_utils.eval_one_epoch(
+            cfg, args, my_model, test_loader, epoch_id, logger, dist_test=False,
+            result_dir=eval_output_dir
+        )
+
+        logger.info(my_model)
+
+    def my_original_evaluate_with_bits():
+        num_bits_list = [16, 8, 4, 3, 2]
+        for act_num_bits in num_bits_list:
+            for weight_num_bits in num_bits_list:
+                my_model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+
+                my_model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+
+                my_model.cuda()
+
+
+
+                quantize_model(my_model, ignore_layer=None, calib_method="max", act_num_bits=act_num_bits, weight_num_bits=weight_num_bits)
+
+                collect_stats(my_model, test_loader, 200)
+
+                compute_amax(my_model, device, method='entropy')
+
+                my_model.cuda()
+
+                eval_utils.eval_one_epoch(
+                    cfg, args, my_model, test_loader, epoch_id, logger, dist_test=False,
+                    result_dir=eval_output_dir
+                )
+
+                logger.info(my_model)
+
+                logger.info(f'********Above is the results if activation bits = {act_num_bits} and weight bits = {weight_num_bits}********')
+
+    def my_evaluate_with_bits():
+        num_bits_list = [16, 8, 4, 3, 2]
+        for act_num_bits in num_bits_list:
+            for weight_num_bits in num_bits_list:
+
+                my_model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+
+                my_model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+
+                my_model.cuda()
+
+
+
+                my_head_quantize_model(my_model, ignore_layer=None, calib_method="max", act_num_bits=act_num_bits, weight_num_bits=weight_num_bits)
+
+                collect_stats(my_model, test_loader, 200)
+
+                compute_amax(my_model, device, method='entropy')
+
+                my_model.cuda()
+
+                eval_utils.eval_one_epoch(
+                    cfg, args, my_model, test_loader, epoch_id, logger, dist_test=False,
+                    result_dir=eval_output_dir
+                )
+
+                logger.info(my_model)
+
+                logger.info(f'********Above is the results if activation bits = {act_num_bits} and weight bits = {weight_num_bits}********')
+
+    def validate_model():
+
+        my_model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+
+        my_model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+
+        my_model.cuda()
+
+        vali_quantize_model(my_model, ignore_layer=None, calib_method="max", scaling_factor=0.5, act_num_bits=8, weight_num_bits=8)
+
+        collect_stats(my_model, test_loader, 200)
+
+        compute_amax(my_model, device, method='entropy')
+
+        my_model.cuda()
+
+        eval_utils.eval_one_epoch(
+            cfg, args, my_model, test_loader, epoch_id, logger, dist_test=False,
+            result_dir=eval_output_dir
+        )
+
+        logger.info(my_model)
+
+    validate_model()
+
+    exit()
 
     # quantize_model(model, ignore_layer=None, calib_method="max")
 
@@ -911,36 +1492,6 @@ def main():
     # )
 
     # logger.info(model)
-
-
-
-
-    # global global_time, exec_times, module_names, gpu_usage
-
-    # global_time = time.time()
-
-    # monitor = MemoryUsageMonitor()
-    # register_gpu_hooks(model, monitor)
-
-    # register_time_hooks(model)
-
-    # logger.info(parameter_count_table(model))
-
-    # model(sample)
-
-    # log_gpu(model)
-
-    # log_time(model)
-
-    # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
-    #     with record_function("model_inference"):
-    #         model(sample)
-
-    # logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
-
-    # model(sample)
-
-    # logger.info(take_time_dict)
 
     exit()
 
