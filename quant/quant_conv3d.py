@@ -3,7 +3,9 @@ import datetime
 import numpy as np
 import os
 import re
+import spconv
 import torch
+import torch.nn as nn
 from pathlib import Path
 from spconv.pytorch.conv import SparseConv3d, SubMConv3d
 from spconv.pytorch.modules import SparseModule
@@ -16,6 +18,8 @@ from pcdet.models import build_network
 from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_file
 from pcdet.utils import common_utils
 
+# sh scripts/dist_test.sh 3 --cfg_file cfgs/nuscenes_models/cbgs_voxel0075_res3d_centerpoint.yaml --ckpt ../weights/cbgs_voxel0075_centerpoint_nds_6648.pth
+
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 pytorch_outputs = {}
@@ -27,9 +31,10 @@ class QuantConv3d(SparseModule):
     def __init__(self, spconv3d):
         super().__init__()
         self.spconv3d = spconv3d
+
         # quantize w
         w_desc = QuantDescriptor(
-            num_bits=8, 
+            num_bits=16, 
             axis=(0)
         )
         w_quant = TensorQuantizer(w_desc)
@@ -40,7 +45,7 @@ class QuantConv3d(SparseModule):
 
         # quantize act
         act_desc = QuantDescriptor(
-            num_bits=8,
+            num_bits=16,
             # unsigned=True
         )
         self.act_quant = TensorQuantizer(act_desc)
@@ -61,30 +66,91 @@ class SQConv3d(SparseModule):
     def __init__(self, spconv3d, scaling_factor):
         super().__init__()
         self.spconv3d = spconv3d
+        self.scaling_factor = scaling_factor
         self.oc, self.kd, self.kh, self.kw, self.ic = self.spconv3d.weight.shape
         self.dh, self.dw, self.dd = self.spconv3d.stride
+        
         return
 
     def forward(self, x):
         # SQ act
         x = x.dense()
-        b, c, d, h, w = x.shape
-        x = x.unfold(2, self.kh, self.dh).unfold(3, self.kw, self.dw).unfold(4, self.kd, self.dd)
-        # [xxx, ic*kh*kw*kd]
-        x = x.contiguous().view(b, c, -1, self.kh, self.kw, self.kd).permute(0, 2, 1, 3, 4).flatten(2)
-        act_scale = torch.max(x.abs(), dim=0)[0]
+        x = x.cpu()
+        print("x", x.shape)
+
+        b, c, d, h, ww = x.shape
+
+        x = x.unfold(2, self.kh, self.dh).unfold(3, self.kw, self.dw)\
+            .unfold(4, self.kd, self.dd)
+        print("unfold", x.shape)
+
+        # [b, xxx, ic*kh*kw*kd]
+        x = x.contiguous().view(b, c, -1, self.kh, self.kw, self.kd)\
+            .permute(0, 2, 1, 3, 4, 5).flatten(2)
+        # [b*xxx, ic*kh*kw*kd]
+        x = x.view(-1, x.shape[-1])
+        print("tx x", x.shape)
+
+        act_scale = torch.max(x.abs_(), dim=0)[0]
+        print("act scale", act_scale.shape)
 
         # SQ w
-        w = self.spconv3d.weight.data.permute(0, 4, 1, 2, 3).contiguous().view(self.oc, -1)
-        w_scale = torch.max(w.abs(), dim=0)[0]
+        # [oc, ic*kh*kw,kd]
+        w = self.spconv3d.weight.data.permute(0, 4, 1, 2, 3)\
+            .contiguous().view(self.oc, -1).transpose(0, 1)
+        print("tx w", w.shape)
+
+        w_scale = torch.max(w.abs(), dim=1)[0]
+        w_scale = w_scale.cpu()
+        print("w scale", w_scale.shape)
 
         scale = act_scale**self.scaling_factor/w_scale**(1-self.scaling_factor)
+        print("scale", scale.shape)
+
         scale[scale==0] = 1
+        # print(scale)
 
         x /= scale
-        self.spconv3d.weight.data = self.conv_layer.weight.data*scale
 
-        # TODO: NEED TO CONVERT x BACK INTO SparseConvTensor
+        scale = scale.to(device)
+        w = w.T
+        w *= scale
+        w = w.T
+        self.spconv3d.weight.data = w.contiguous()\
+            .view(self.oc, self.ic, self.kd, self.kh, self.kw).permute(0, 2, 3, 4, 1)
+
+        x = x.view(b, -1, x.shape[-1]).permute(0, 2, 1)
+        print("tx x", x.shape)
+
+        # ====== start folding back here ======
+        out_h = int((h + 2 * 1 - self.kh) / self.dh + 1)
+        out_w = int((ww + 2 * 1 - self.kw) / self.dw + 1)
+        out_d = int((d + 2 * 1 - self.kd) / self.dd + 1)
+        self.fold = nn.Fold(
+            output_size=[out_h, out_w, out_d],
+            kernel_size=[self.kd, self.kh, self.kw],
+            padding=1,
+            stride=self.spconv3d.stride,
+        )
+        x = self.fold(x)
+
+        # foldnd = unfoldNd.FoldNd(
+        #     (out_h, out_w, out_d),
+        #     kernel_size=(self.kh, self.kw, self.kd),
+        #     dilation=1,
+        #     padding=1,
+        #     stride=self.spconv3d.stride,
+        # )
+        # x = foldnd(x)
+
+        print("fold x", x.shape)
+
+        # ====================================
+
+        x = x.to(device)
+
+        x = spconv.SparseConvTensor.from_dense(x)
+
         x = self.spconv3d(x)
         return x
 
@@ -100,7 +166,7 @@ def parse_config():
     parser.add_argument('--pretrained_model', type=str, default=None, help='pretrained_model')
     parser.add_argument('--launcher', choices=['none', 'pytorch', 'slurm'], default='none')
     parser.add_argument('--tcp_port', type=int, default=18888, help='tcp port for distrbuted training')
-    parser.add_argument('--local_rank', type=int, default=0, help='local rank for distributed training')
+    parser.add_argument('--local-rank', type=int, default=0, help='local rank for distributed training')
     parser.add_argument('--set', dest='set_cfgs', default=None, nargs=argparse.REMAINDER,
                         help='set extra config keys if needed')
 
@@ -115,6 +181,8 @@ def parse_config():
     args = parser.parse_args()
 
     cfg_from_yaml_file(args.cfg_file, cfg)
+    # NEED THIS I DONNO WHY
+    # args.local_rank = int(os.environ['LOCAL_RANK'])
     cfg.TAG = Path(args.cfg_file).stem
     cfg.EXP_GROUP_PATH = '/'.join(args.cfg_file.split('/')[1:-1])  # remove 'cfgs' and 'xxxx.yaml'
 
@@ -137,9 +205,9 @@ def sq_conv3d(model, module_dict, curr_path, alpha, act_num_bits, weight_num_bit
         if isinstance(module, (SubMConv3d, SparseConv3d)):
             # print(module)
             # replace layer with Pytorch Quantization
-            model._modules[name] = QuantConv3d(spconv3d=module)
+            # model._modules[name] = QuantConv3d(spconv3d=module)
             # replace layer with SQ Quantization
-            # model._modules[name] = QuantConv3d(spconv3d=module, scaling_factor=0.5)
+            model._modules[name] = SQConv3d(spconv3d=module, scaling_factor=0.5)
 
     return
 
