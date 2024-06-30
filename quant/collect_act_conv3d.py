@@ -75,6 +75,7 @@ class SQConv3d(SparseModule):
             # unsigned=True
         )
         self.act_quant = TensorQuantizer(act_desc)
+        self.original_weight = self.spconv3d.weight.data.clone()
 
     def forward(self, x):
         features = x.features
@@ -83,16 +84,17 @@ class SQConv3d(SparseModule):
         scale = torch.sqrt(features_max/weight_max)
         if scale == 0:
             scale = 1
-        # print(f'features_max: {features_max} | weight_max: {weight_max} | scale: {scale}')
-        # features /= scale
+        print(f'features_max: {features_max}\t| weight_max: {weight_max}\t| scale: {scale}')
+        features /= scale
         features = self.act_quant(features)
+        x = x.replace_feature(features)
         oc, kh, kw, kd, ic = self.spconv3d.weight.data.shape
         w = self.spconv3d.weight.data.permute(0, 4, 1, 2, 3).contiguous().view(oc, -1)
-        # w *= scale
+        w *= scale
         w = self.w_quant(w)
         self.spconv3d.weight.data = w.view(oc, ic, kh, kw, kd).permute(0, 2, 3, 4, 1).contiguous()
-        x = x.replace_feature(features)
         x = self.spconv3d(x)
+        self.spconv3d.weight.data = self.original_weight.clone()
         return x
 
 
@@ -141,7 +143,7 @@ def sq_conv3d(model, module_dict, curr_path, alpha, act_num_bits, weight_num_bit
         # print(module)
         path = f"{curr_path}.{name}" if curr_path else name
         sq_conv3d(module, module_dict, path, alpha, act_num_bits, weight_num_bits)
-        if isinstance(module, SubMConv3d) and path != 'backbone_3d.conv_input.0':
+        if isinstance(module, (SubMConv3d, SparseConv3d)) and path != 'backbone_3d.conv_input.0':
         # if isinstance(module, SubMConv3d):
             # print(module)
             # replace layer with Pytorch Quantization
