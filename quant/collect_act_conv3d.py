@@ -20,9 +20,9 @@ from pcdet.utils import common_utils
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-global pytorch_outputs
-pytorch_outputs = {}
-weight_scale = {}
+# global pytorch_outputs
+# pytorch_outputs = {}
+# weight_scale = {}
 
 class QuantConv3d(SparseModule):
     """Pytorch Quantization"""
@@ -47,7 +47,6 @@ class QuantConv3d(SparseModule):
         )
         self.act_quant = TensorQuantizer(act_desc)
 
-        self.spconv3d = spconv3d
         return
 
     def forward(self, x):
@@ -59,34 +58,40 @@ class QuantConv3d(SparseModule):
 
 
 class SQConv3d(SparseModule):
-    """SmoothQuant Quantization"""
-    def __init__(self, spconv3d, scaling_factor):
+    """Pytorch Quantization"""
+    def __init__(self, spconv3d):
         super().__init__()
         self.spconv3d = spconv3d
-        self.oc, self.kd, self.kh, self.kw, self.ic = self.spconv3d.weight.shape
-        self.dh, self.dw, self.dd = self.spconv3d.stride
-        return
+        # quantize w
+        w_desc = QuantDescriptor(
+            num_bits=8, 
+            axis=(0)
+        )
+        self.w_quant = TensorQuantizer(w_desc)
+
+        # quantize act
+        act_desc = QuantDescriptor(
+            num_bits=8,
+            # unsigned=True
+        )
+        self.act_quant = TensorQuantizer(act_desc)
 
     def forward(self, x):
-        # SQ act
-        x = x.dense()
-        b, c, d, h, w = x.shape
-        x = x.unfold(2, self.kh, self.dh).unfold(3, self.kw, self.dw).unfold(4, self.kd, self.dd)
-        # [xxx, ic*kh*kw*kd]
-        x = x.contiguous().view(b, c, -1, self.kh, self.kw, self.kd).permute(0, 2, 1, 3, 4).flatten(2)
-        act_scale = torch.max(x.abs(), dim=0)[0]
-
-        # SQ w
-        w = self.spconv3d.weight.data.permute(0, 4, 1, 2, 3).contiguous().view(self.oc, -1)
-        w_scale = torch.max(w.abs(), dim=0)[0]
-
-        scale = act_scale**self.scaling_factor/w_scale**(1-self.scaling_factor)
-        scale[scale==0] = 1
-
-        x /= scale
-        self.spconv3d.weight.data = self.conv_layer.weight.data*scale
-
-        # TODO: NEED TO CONVERT x BACK INTO SparseConvTensor
+        features = x.features
+        features_max = features.abs().max()
+        weight_max = self.spconv3d.weight.data.abs().max()
+        scale = torch.sqrt(features_max/weight_max)
+        if scale == 0:
+            scale = 1
+        # print(f'features_max: {features_max} | weight_max: {weight_max} | scale: {scale}')
+        # features /= scale
+        features = self.act_quant(features)
+        oc, kh, kw, kd, ic = self.spconv3d.weight.data.shape
+        w = self.spconv3d.weight.data.permute(0, 4, 1, 2, 3).contiguous().view(oc, -1)
+        # w *= scale
+        w = self.w_quant(w)
+        self.spconv3d.weight.data = w.view(oc, ic, kh, kw, kd).permute(0, 2, 3, 4, 1).contiguous()
+        x = x.replace_feature(features)
         x = self.spconv3d(x)
         return x
 
@@ -136,10 +141,12 @@ def sq_conv3d(model, module_dict, curr_path, alpha, act_num_bits, weight_num_bit
         # print(module)
         path = f"{curr_path}.{name}" if curr_path else name
         sq_conv3d(module, module_dict, path, alpha, act_num_bits, weight_num_bits)
-        if isinstance(module, (SubMConv3d, SparseConv3d)):
+        if isinstance(module, SubMConv3d) and path != 'backbone_3d.conv_input.0':
+        # if isinstance(module, SubMConv3d):
             # print(module)
             # replace layer with Pytorch Quantization
-            model._modules[name] = QuantConv3d(spconv3d=module)
+            # model._modules[name] = QuantConv3d(spconv3d=module)
+            model._modules[name] = SQConv3d(spconv3d=module)
             # replace layer with SQ Quantization
             # model._modules[name] = QuantConv3d(spconv3d=module, scaling_factor=0.5)
 
@@ -228,26 +235,28 @@ def main() -> None:
     model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
     model.cuda()
 
-    register_collect_input_hook(model)
+    sq_conv3d(model, module_dict={}, curr_path="", alpha=0.5, act_num_bits=8, weight_num_bits=8)
 
-    with torch.no_grad():
-        for batch_dict in test_loader:
-            load_data_to_gpu(batch_dict)
-            model(batch_dict)
-            break
-    
-    # Save the input activations
-    with open('pytorch_outputs.pkl', 'wb') as f:
-        pickle.dump([pytorch_outputs, weight_scale], f)
-    
-    print(pytorch_outputs)
-    print(weight_scale)
-    print('Done!')
+    eval_utils.eval_one_epoch(
+        cfg, args, model, test_loader, epoch_id, logger, dist_test=dist_test,
+        result_dir=eval_output_dir
+    )
 
-    # eval_utils.eval_one_epoch(
-    #     cfg, args, model, test_loader, epoch_id, logger, dist_test=dist_test,
-    #     result_dir=eval_output_dir
-    # )
+    # register_collect_input_hook(model)
+
+    # with torch.no_grad():
+    #     for batch_dict in test_loader:
+    #         load_data_to_gpu(batch_dict)
+    #         model(batch_dict)
+    #         break
+    
+    # # Save the input activations
+    # with open('pytorch_outputs.pkl', 'wb') as f:
+    #     pickle.dump([pytorch_outputs, weight_scale], f)
+    
+    # print(pytorch_outputs)
+    # print(weight_scale)
+    # print('Done!')
 
     return
 

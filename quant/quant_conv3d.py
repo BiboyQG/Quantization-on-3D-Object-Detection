@@ -6,6 +6,7 @@ import re
 import spconv
 import torch
 import torch.nn as nn
+import unfoldNd
 from pathlib import Path
 from spconv.pytorch.conv import SparseConv3d, SubMConv3d
 from spconv.pytorch.modules import SparseModule
@@ -126,23 +127,27 @@ class SQConv3d(SparseModule):
         out_h = int((h + 2 * 1 - self.kh) / self.dh + 1)
         out_w = int((ww + 2 * 1 - self.kw) / self.dw + 1)
         out_d = int((d + 2 * 1 - self.kd) / self.dd + 1)
-        self.fold = nn.Fold(
-            output_size=[out_h, out_w, out_d],
-            kernel_size=[self.kd, self.kh, self.kw],
-            padding=1,
-            stride=self.spconv3d.stride,
-        )
-        x = self.fold(x)
+        print('out_h:', out_h)
+        print('out_w:', out_w)
+        print('out_d:', out_d)
 
-        # foldnd = unfoldNd.FoldNd(
-        #     (out_h, out_w, out_d),
-        #     kernel_size=(self.kh, self.kw, self.kd),
-        #     dilation=1,
+        # self.fold = nn.Fold(
+        #     output_size=[out_h, out_w, out_d],
+        #     kernel_size=[self.kd, self.kh, self.kw],
         #     padding=1,
         #     stride=self.spconv3d.stride,
         # )
-        # x = foldnd(x)
+        # x = self.fold(x)
 
+        foldnd = unfoldNd.FoldNd(
+            (out_h, out_w, out_d),
+            kernel_size=(self.kh, self.kw, self.kd),
+            dilation=1,
+            padding=1,
+            stride=self.spconv3d.stride,
+        )
+        x = foldnd(x)
+        # exit()
         print("fold x", x.shape)
 
         # ====================================
