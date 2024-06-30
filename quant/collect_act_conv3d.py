@@ -85,14 +85,18 @@ class SQConv3d(SparseModule):
         if scale == 0:
             scale = 1
         print(f'features_max: {features_max}\t| weight_max: {weight_max}\t| scale: {scale}')
+
         features /= scale
         features = self.act_quant(features)
         x = x.replace_feature(features)
+
         oc, kh, kw, kd, ic = self.spconv3d.weight.data.shape
         w = self.spconv3d.weight.data.permute(0, 4, 1, 2, 3).contiguous().view(oc, -1)
         w *= scale
         w = self.w_quant(w)
+
         self.spconv3d.weight.data = w.view(oc, ic, kh, kw, kd).permute(0, 2, 3, 4, 1).contiguous()
+        
         x = self.spconv3d(x)
         self.spconv3d.weight.data = self.original_weight.clone()
         return x
