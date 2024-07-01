@@ -5,6 +5,7 @@ import os
 import re
 import torch
 import pickle
+from tqdm import tqdm
 from pathlib import Path
 from functools import partial
 from spconv.pytorch.conv import SparseConv3d, SubMConv3d
@@ -23,6 +24,11 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 # global pytorch_outputs
 # pytorch_outputs = {}
 # weight_scale = {}
+global original_act, sq_act, q_act, layer_name
+layer_name = []
+original_act = []
+sq_act = []
+q_act = []
 
 class QuantConv3d(SparseModule):
     """Pytorch Quantization"""
@@ -40,10 +46,9 @@ class QuantConv3d(SparseModule):
         w = w_quant(w)
         self.spconv3d.weight.data = w.view(oc, ic, kh, kw, kd).permute(0, 2, 3, 4, 1).contiguous()
 
-        # quantize act
+        # act quantizer
         act_desc = QuantDescriptor(
-            num_bits=8,
-            # unsigned=True
+            num_bits=8
         )
         self.act_quant = TensorQuantizer(act_desc)
 
@@ -62,19 +67,19 @@ class SQConv3d(SparseModule):
     def __init__(self, spconv3d):
         super().__init__()
         self.spconv3d = spconv3d
-        # quantize w
+        # w quantizer
         w_desc = QuantDescriptor(
             num_bits=8, 
             axis=(0)
         )
         self.w_quant = TensorQuantizer(w_desc)
 
-        # quantize act
+        # act quantizer
         act_desc = QuantDescriptor(
-            num_bits=8,
-            # unsigned=True
+            num_bits=8
         )
         self.act_quant = TensorQuantizer(act_desc)
+
         self.original_weight = self.spconv3d.weight.data.clone()
 
     def forward(self, x):
@@ -84,7 +89,7 @@ class SQConv3d(SparseModule):
         scale = torch.sqrt(features_max/weight_max)
         if scale == 0:
             scale = 1
-        print(f'features_max: {features_max}\t| weight_max: {weight_max}\t| scale: {scale}')
+        # print(f'features_max: {features_max}\t| weight_max: {weight_max}\t| scale: {scale}')
 
         features /= scale
         features = self.act_quant(features)
@@ -96,7 +101,7 @@ class SQConv3d(SparseModule):
         w = self.w_quant(w)
 
         self.spconv3d.weight.data = w.view(oc, ic, kh, kw, kd).permute(0, 2, 3, 4, 1).contiguous()
-        
+
         x = self.spconv3d(x)
         self.spconv3d.weight.data = self.original_weight.clone()
         return x
@@ -142,7 +147,7 @@ def parse_config():
 
 
 def sq_conv3d(model, module_dict, curr_path, alpha, act_num_bits, weight_num_bits):
-
+    global layer_name
     for name, module in model.named_children():
         # print(module)
         path = f"{curr_path}.{name}" if curr_path else name
@@ -152,7 +157,25 @@ def sq_conv3d(model, module_dict, curr_path, alpha, act_num_bits, weight_num_bit
             # print(module)
             # replace layer with Pytorch Quantization
             # model._modules[name] = QuantConv3d(spconv3d=module)
+            layer_name.append(path)
             model._modules[name] = SQConv3d(spconv3d=module)
+            # replace layer with SQ Quantization
+            # model._modules[name] = QuantConv3d(spconv3d=module, scaling_factor=0.5)
+
+    return
+
+
+def q_conv3d(model, module_dict, curr_path, alpha, act_num_bits, weight_num_bits):
+    for name, module in model.named_children():
+        # print(module)
+        path = f"{curr_path}.{name}" if curr_path else name
+        q_conv3d(module, module_dict, path, alpha, act_num_bits, weight_num_bits)
+        if isinstance(module, (SubMConv3d, SparseConv3d)) and path != 'backbone_3d.conv_input.0':
+        # if isinstance(module, SubMConv3d):
+            # print(module)
+            # replace layer with Pytorch Quantization
+            model._modules[name] = QuantConv3d(spconv3d=module)
+            # model._modules[name] = SQConv3d(spconv3d=module)
             # replace layer with SQ Quantization
             # model._modules[name] = QuantConv3d(spconv3d=module, scaling_factor=0.5)
 
@@ -176,8 +199,44 @@ def register_collect_input_hook(model):
                 module.register_forward_pre_hook(partial(forward_hook, name=name))
 
 
+def register_collect_act_hook(model):
+
+        def forward_hook(module, input, name):
+            global original_act
+            act = input[0].features.detach().cpu()
+            original_act.append(act)
+
+        for name, module in model.named_modules():
+            if isinstance(module, (SparseConv3d, SubMConv3d)):
+                module.register_forward_pre_hook(partial(forward_hook, name=name))
+
+
+def register_collect_q_act_hook(model):
+
+        def forward_hook(module, input, name):
+            global q_act
+            act = input[0].features.detach().cpu()
+            q_act.append(act)
+
+        for name, module in model.named_modules():
+            if name in layer_name:
+                module.register_forward_pre_hook(partial(forward_hook, name=name))
+
+
+def register_collect_sq_act_hook(model):
+
+        def forward_hook(module, input, name):
+            global sq_act
+            act = input[0].features.detach().cpu()
+            sq_act.append(act)
+
+        global layer_name
+        for name, module in model.named_modules():
+            if name in layer_name:
+                module.register_forward_pre_hook(partial(forward_hook, name=name))
+
+
 def main() -> None:
-    global pytorch_outputs, weight_scale
     args, cfg = parse_config()
 
     if args.infer_time:
@@ -237,16 +296,76 @@ def main() -> None:
         dist=dist_test, workers=args.workers, logger=logger, training=False
     )
 
-    model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
-    model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
-    model.cuda()
+    # model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+    # model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+    # model.cuda()
 
-    sq_conv3d(model, module_dict={}, curr_path="", alpha=0.5, act_num_bits=8, weight_num_bits=8)
+    # sq_conv3d(model, module_dict={}, curr_path="", alpha=0.5, act_num_bits=8, weight_num_bits=8)
+    # print(model)
 
-    eval_utils.eval_one_epoch(
-        cfg, args, model, test_loader, epoch_id, logger, dist_test=dist_test,
-        result_dir=eval_output_dir
-    )
+    # eval_utils.eval_one_epoch(
+    #     cfg, args, model, test_loader, epoch_id, logger, dist_test=dist_test,
+    #     result_dir=eval_output_dir
+    # )
+
+    def get_l1_loss(batch_size=1):
+        l1loss = torch.nn.L1Loss()
+        model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+        model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+        model.cuda()
+        register_collect_act_hook(model)
+        idx=0
+        with torch.no_grad():
+            for batch_dict in tqdm(test_loader, total=batch_size, desc='Original'):
+                load_data_to_gpu(batch_dict)
+                model(batch_dict)
+                idx+=1
+                if idx == batch_size:
+                    break
+        
+        sq_model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+        sq_model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+        sq_model.cuda()
+        sq_conv3d(sq_model, module_dict={}, curr_path="", alpha=0.5, act_num_bits=8, weight_num_bits=8)
+        register_collect_sq_act_hook(sq_model)
+        idx=0
+        with torch.no_grad():
+            for batch_dict in tqdm(test_loader, total=batch_size, desc='SQ'):
+                load_data_to_gpu(batch_dict)
+                sq_model(batch_dict)
+                idx+=1
+                if idx == batch_size:
+                    break
+
+        q_model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+        q_model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+        q_model.cuda()
+        q_conv3d(q_model, module_dict={}, curr_path="", alpha=0.5, act_num_bits=8, weight_num_bits=8)
+        register_collect_q_act_hook(q_model)
+        idx=0
+        with torch.no_grad():
+            for batch_dict in tqdm(test_loader, total=batch_size, desc='Q'):
+                load_data_to_gpu(batch_dict)
+                q_model(batch_dict)
+                idx+=1
+                if idx == batch_size:
+                    break
+        
+
+        global original_act, sq_act, q_act, layer_name
+        for i in range(batch_size):
+            original_act.pop(i*20)
+        print('length of layer_name:', len(layer_name))
+        print('length of original_act:', len(original_act))
+        print('length of sq_act:', len(sq_act))
+        print('length of q_act:', len(q_act))
+        layer_name = layer_name * batch_size
+        for i, name in enumerate(layer_name):
+            logger.info(f'name: {name}\t| SQ l1loss: {l1loss(original_act[i], sq_act[i]).item():.6f}\t| Q l1loss: {l1loss(original_act[i], q_act[i]).item():.6f}') 
+        
+
+    get_l1_loss(100)
+
 
     # register_collect_input_hook(model)
 
