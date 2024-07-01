@@ -29,6 +29,9 @@ layer_name = []
 original_act = []
 sq_act = []
 q_act = []
+sq_list = [
+    'backbone_3d.conv2.2.conv1',
+]
 
 class QuantConv3d(SparseModule):
     """Pytorch Quantization"""
@@ -80,16 +83,16 @@ class SQConv3d(SparseModule):
         )
         self.act_quant = TensorQuantizer(act_desc)
 
+        self.weight_max = self.spconv3d.weight.data.abs().max()
         self.original_weight = self.spconv3d.weight.data.clone()
 
     def forward(self, x):
         features = x.features
         features_max = features.abs().max()
-        weight_max = self.spconv3d.weight.data.abs().max()
-        scale = torch.sqrt(features_max/weight_max)
+        scale = torch.sqrt(features_max/self.weight_max)
         if scale == 0:
             scale = 1
-        # print(f'features_max: {features_max}\t| weight_max: {weight_max}\t| scale: {scale}')
+        print(f'features_max: {features_max:.6f}\t| weight_max: {self.weight_max:.6f}\t| scale: {scale:.6f}')
 
         features /= scale
         features = self.act_quant(features)
@@ -152,7 +155,7 @@ def sq_conv3d(model, module_dict, curr_path, alpha, act_num_bits, weight_num_bit
         # print(module)
         path = f"{curr_path}.{name}" if curr_path else name
         sq_conv3d(module, module_dict, path, alpha, act_num_bits, weight_num_bits)
-        if isinstance(module, (SubMConv3d, SparseConv3d)) and path != 'backbone_3d.conv_input.0':
+        if isinstance(module, SubMConv3d) and path in sq_list:
         # if isinstance(module, SubMConv3d):
             # print(module)
             # replace layer with Pytorch Quantization
@@ -161,6 +164,8 @@ def sq_conv3d(model, module_dict, curr_path, alpha, act_num_bits, weight_num_bit
             model._modules[name] = SQConv3d(spconv3d=module)
             # replace layer with SQ Quantization
             # model._modules[name] = QuantConv3d(spconv3d=module, scaling_factor=0.5)
+        # if isinstance(module, SparseConv3d):
+        #     model._modules[name] = QuantConv3d(spconv3d=module)
 
     return
 
@@ -349,22 +354,22 @@ def main() -> None:
         print('length of sq_act:', len(sq_act))
         print('length of q_act:', len(q_act))
         for i, name in enumerate(layer_name):
-            logger.info(f'name: {name}\t| SQ l1loss: {l1loss(original_act[i], sq_act[i]).item():.6f}\t| Q l1loss: {l1loss(original_act[i], q_act[i]).item():.6f}') 
+            logger.info(f'name: {name}\t| SQ l1loss: {l1loss(original_act[i], sq_act[i]).item():.6f}\t| Q l1loss: {l1loss(original_act[i], q_act[i]).item():.6f}')
         
 
-    get_l1_loss(200)
+    # get_l1_loss(1200)
 
-    # model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
-    # model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
-    # model.cuda()
+    model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+    model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+    model.cuda()
 
-    # sq_conv3d(model, module_dict={}, curr_path="", alpha=0.5, act_num_bits=8, weight_num_bits=8)
-    # print(model)
+    sq_conv3d(model, module_dict={}, curr_path="", alpha=0.5, act_num_bits=8, weight_num_bits=8)
+    print(model)
 
-    # eval_utils.eval_one_epoch(
-    #     cfg, args, model, test_loader, epoch_id, logger, dist_test=dist_test,
-    #     result_dir=eval_output_dir
-    # )
+    eval_utils.eval_one_epoch(
+        cfg, args, model, test_loader, epoch_id, logger, dist_test=dist_test,
+        result_dir=eval_output_dir
+    )
 
 
     # register_collect_input_hook(model)
