@@ -21,7 +21,7 @@ from pcdet.utils import common_utils
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# global pytorch_outputs
+# global pytorch_outputs, weight_scale
 # pytorch_outputs = {}
 # weight_scale = {}
 global original_act, sq_act, q_act, layer_name
@@ -205,6 +205,7 @@ def register_collect_act_hook(model):
             global original_act
             act = input[0].features.detach().cpu()
             original_act.append(act)
+            original_act = original_act[-20:]
 
         for name, module in model.named_modules():
             if isinstance(module, (SparseConv3d, SubMConv3d)):
@@ -217,6 +218,7 @@ def register_collect_q_act_hook(model):
             global q_act
             act = input[0].features.detach().cpu()
             q_act.append(act)
+            q_act = q_act[-20:]
 
         for name, module in model.named_modules():
             if name in layer_name:
@@ -229,6 +231,7 @@ def register_collect_sq_act_hook(model):
             global sq_act
             act = input[0].features.detach().cpu()
             sq_act.append(act)
+            sq_act = sq_act[-20:]
 
         global layer_name
         for name, module in model.named_modules():
@@ -296,18 +299,6 @@ def main() -> None:
         dist=dist_test, workers=args.workers, logger=logger, training=False
     )
 
-    # model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
-    # model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
-    # model.cuda()
-
-    # sq_conv3d(model, module_dict={}, curr_path="", alpha=0.5, act_num_bits=8, weight_num_bits=8)
-    # print(model)
-
-    # eval_utils.eval_one_epoch(
-    #     cfg, args, model, test_loader, epoch_id, logger, dist_test=dist_test,
-    #     result_dir=eval_output_dir
-    # )
-
     def get_l1_loss(batch_size=1):
         l1loss = torch.nn.L1Loss()
         model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
@@ -320,7 +311,7 @@ def main() -> None:
                 load_data_to_gpu(batch_dict)
                 model(batch_dict)
                 idx+=1
-                if idx == batch_size:
+                if idx == batch_size + 1:
                     break
         
         sq_model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
@@ -334,7 +325,7 @@ def main() -> None:
                 load_data_to_gpu(batch_dict)
                 sq_model(batch_dict)
                 idx+=1
-                if idx == batch_size:
+                if idx == batch_size + 1:
                     break
 
         q_model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
@@ -348,23 +339,32 @@ def main() -> None:
                 load_data_to_gpu(batch_dict)
                 q_model(batch_dict)
                 idx+=1
-                if idx == batch_size:
+                if idx == batch_size + 1:
                     break
         
 
         global original_act, sq_act, q_act, layer_name
-        for i in range(batch_size):
-            original_act.pop(i*20)
         print('length of layer_name:', len(layer_name))
         print('length of original_act:', len(original_act))
         print('length of sq_act:', len(sq_act))
         print('length of q_act:', len(q_act))
-        layer_name = layer_name * batch_size
         for i, name in enumerate(layer_name):
             logger.info(f'name: {name}\t| SQ l1loss: {l1loss(original_act[i], sq_act[i]).item():.6f}\t| Q l1loss: {l1loss(original_act[i], q_act[i]).item():.6f}') 
         
 
-    get_l1_loss(100)
+    get_l1_loss(200)
+
+    # model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=test_set)
+    # model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
+    # model.cuda()
+
+    # sq_conv3d(model, module_dict={}, curr_path="", alpha=0.5, act_num_bits=8, weight_num_bits=8)
+    # print(model)
+
+    # eval_utils.eval_one_epoch(
+    #     cfg, args, model, test_loader, epoch_id, logger, dist_test=dist_test,
+    #     result_dir=eval_output_dir
+    # )
 
 
     # register_collect_input_hook(model)
