@@ -29,13 +29,13 @@ sq_outputs = {}
 
 class QuantConv3d(SparseModule):
     """Pytorch Quantization"""
-    def __init__(self, spconv3d):
+    def __init__(self, spconv3d, act_bits, w_bits):
         super().__init__()
         self.spconv3d = spconv3d
 
         # quantize w
         w_desc = QuantDescriptor(
-            num_bits=16,
+            num_bits=w_bits,
             axis=(0)
         )
         w_quant = TensorQuantizer(w_desc)
@@ -46,7 +46,7 @@ class QuantConv3d(SparseModule):
 
         # quantize act
         act_desc = QuantDescriptor(
-            num_bits=8,
+            num_bits=act_bits,
             # unsigned=True
         )
         self.act_quant = TensorQuantizer(act_desc)
@@ -201,15 +201,15 @@ def parse_config():
     return args, cfg
 
 
-def q_conv3d(model, module_dict, curr_path, alpha, act_num_bits, weight_num_bits):
+def q_conv3d(model, module_dict, curr_path, w_bits, act_bits):
     for name, module in model.named_children():
         # print(module)
         path = f"{curr_path}.{name}" if curr_path else name
-        q_conv3d(module, module_dict, path, alpha, act_num_bits, weight_num_bits)
-        if isinstance(module, (SubMConv3d, SparseConv3d)) and path != 'backbone_3d.conv_input.0':
+        q_conv3d(module, module_dict, path, w_bits, act_bits)
+        if isinstance(module, (SparseConv3d,)) and path != 'backbone_3d.conv_input.0':
             # print(module)
             # replace layer with Pytorch Quantization
-            model._modules[name] = QuantConv3d(spconv3d=module)
+            model._modules[name] = QuantConv3d(spconv3d=module, w_bits=w_bits, act_bits=act_bits)
             # replace layer with SQ Quantization (currently unable to perform SQ)
             # model._modules[name] = SQConv3d(spconv3d=module, scaling_factor=0.5)
 
@@ -290,7 +290,7 @@ def main() -> None:
     model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
     model.cuda()
 
-    q_conv3d(model, module_dict={}, curr_path="", alpha=0.5, act_num_bits=8, weight_num_bits=8)
+    q_conv3d(model, module_dict={}, curr_path="", w_bits=8, act_bits=8)
     print(model)
 
     eval_utils.eval_one_epoch(
