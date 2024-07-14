@@ -5,6 +5,7 @@ import os
 import re
 import spconv
 import torch
+import torch.multiprocessing as mp
 import torch.nn as nn
 import unfoldNd
 from pathlib import Path
@@ -28,7 +29,7 @@ sq_outputs = {}
 
 
 class QuantConv3d(SparseModule):
-    """Pytorch Quantization"""
+    """Standard Quantization"""
     def __init__(self, spconv3d, act_bits, w_bits):
         super().__init__()
         self.spconv3d = spconv3d
@@ -38,11 +39,8 @@ class QuantConv3d(SparseModule):
             num_bits=w_bits,
             axis=(0)
         )
-        w_quant = TensorQuantizer(w_desc)
-        oc, kh, kw, kd, ic = self.spconv3d.weight.data.shape
-        w = self.spconv3d.weight.data.permute(0, 4, 1, 2, 3).contiguous().view(oc, -1)
-        w = w_quant(w)
-        self.spconv3d.weight.data = w.view(oc, ic, kh, kw, kd).permute(0, 2, 3, 4, 1).contiguous()
+        self.w_quant = TensorQuantizer(w_desc)
+        self.orig_w = self.spconv3d.weight.data.clone()
 
         # quantize act
         act_desc = QuantDescriptor(
@@ -55,15 +53,93 @@ class QuantConv3d(SparseModule):
         return
 
     def forward(self, x):
+        oc, kh, kw, kd, ic = self.spconv3d.weight.data.shape
+        w = self.spconv3d.weight.data.permute(0, 4, 1, 2, 3).contiguous().view(oc, -1)
+        w = self.w_quant(w)
+        self.spconv3d.weight.data = w.view(oc, ic, kh, kw, kd).permute(0, 2, 3, 4, 1).contiguous()
+
         features = x.features
+
         features = self.act_quant(features)
         x = x.replace_feature(features)
         x = self.spconv3d(x)
+        self.spconv3d.weight.data = self.orig_w.clone()
+        return x
+
+
+class GQConv3d(SparseModule):
+    """Group Quantization"""
+    def __init__(self, spconv3d, act_bits, w_bits, n):
+        super().__init__()
+        self.spconv3d = spconv3d
+
+        # quantize w
+        w_desc = QuantDescriptor(
+            num_bits=w_bits,
+            axis=(0)
+        )
+        self.w_quant = TensorQuantizer(w_desc)
+        self.orig_w = self.spconv3d.weight.data.clone()
+
+        # quantize act
+        act_desc = QuantDescriptor(
+            num_bits=act_bits,
+            # unsigned=True
+            axis=(0)
+        )
+        self.act_quant = TensorQuantizer(act_desc)
+
+        # n groups
+        self.n = n
+
+        self.spconv3d = spconv3d
+        return
+
+    def forward(self, x):
+        mp.set_start_method('spawn', force=True)
+
+        oc, kh, kw, kd, ic = self.spconv3d.weight.data.shape
+        w = self.spconv3d.weight.data.permute(0, 4, 1, 2, 3).contiguous().view(oc, -1)
+        w = self.w_quant(w)
+        self.spconv3d.weight.data = w.view(oc, ic, kh, kw, kd).permute(0, 2, 3, 4, 1).contiguous()
+
+        features = x.features
+        # print(features)
+        # print("orig feat", features.shape)
+        indices = x.indices
+        # print("orig idx ", indices)
+
+        batch_idx = indices[:, 0].unique()
+
+        for i in batch_idx:
+            batch = features[indices[:, 0] == i]
+            # print(batch.shape)
+            if self.n is not None:
+                quant_groups = []
+                groups = torch.split(tensor=batch, split_size_or_sections=self.n, dim=0)
+                # with mp.Pool(processes=len(groups)) as pool:
+                    # quant_groups = pool.map(self.act_quant, groups)
+                for group in groups:
+                    quant_group = self.act_quant(group)
+                    quant_groups.append(quant_group)
+                # print(len(quant_groups))
+                # exit()
+                quant_groups = torch.cat(tensors=quant_groups, dim=0)
+                features[indices[:, 0] == i] = quant_groups
+            else:
+                batch = self.act_quant(batch)
+                features[indices[:, 0] == i] = batch
+
+        # print("new feat", features.shape)
+        # exit()
+        x = x.replace_feature(features)
+        x = self.spconv3d(x)
+        self.spconv3d.weight.data = self.orig_w.clone()
         return x
 
 
 class SQConv3d(SparseModule):
-    """SmoothQuant Quantization"""
+    """SmoothQuant"""
     def __init__(self, spconv3d, scaling_factor):
         super().__init__()
         self.spconv3d = spconv3d
@@ -201,16 +277,18 @@ def parse_config():
     return args, cfg
 
 
-def q_conv3d(model, module_dict, curr_path, w_bits, act_bits):
+def q_conv3d(model, module_dict, curr_path, w_bits, act_bits, n):
     for name, module in model.named_children():
         # print(module)
         path = f"{curr_path}.{name}" if curr_path else name
-        q_conv3d(module, module_dict, path, w_bits, act_bits)
-        if isinstance(module, (SparseConv3d,)) and path != 'backbone_3d.conv_input.0':
+        q_conv3d(module, module_dict, path, w_bits, act_bits, n)
+        if isinstance(module, (SubMConv3d, SparseConv3d)) and path != 'backbone_3d.conv_input.0':
             # print(module)
-            # replace layer with Pytorch Quantization
-            model._modules[name] = QuantConv3d(spconv3d=module, w_bits=w_bits, act_bits=act_bits)
-            # replace layer with SQ Quantization (currently unable to perform SQ)
+            # replace layer with standard 1uantization
+            # model._modules[name] = QuantConv3d(spconv3d=module, w_bits=w_bits, act_bits=act_bits)
+            # group quant
+            model._modules[name] = GQConv3d(spconv3d=module, w_bits=w_bits, act_bits=act_bits, n=n)
+            # replace layer with SQ (currently unable to perform SQ)
             # model._modules[name] = SQConv3d(spconv3d=module, scaling_factor=0.5)
 
     return
@@ -290,7 +368,7 @@ def main() -> None:
     model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=False, pre_trained_path=args.pretrained_model)
     model.cuda()
 
-    q_conv3d(model, module_dict={}, curr_path="", w_bits=8, act_bits=8)
+    q_conv3d(model, module_dict={}, curr_path="", w_bits=8, act_bits=8, n=64)
     print(model)
 
     eval_utils.eval_one_epoch(
