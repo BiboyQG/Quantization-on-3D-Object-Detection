@@ -68,7 +68,7 @@ no_list = [
 
 class QuantConv3d(SparseModule):
     """Pytorch Quantization"""
-    def __init__(self, spconv3d, act_bits, w_bits):
+    def __init__(self, spconv3d, act_bits, w_bits, cw: bool):
         super().__init__()
         self.spconv3d = spconv3d
 
@@ -81,10 +81,17 @@ class QuantConv3d(SparseModule):
         self.orig_w = self.spconv3d.weight.data.clone()
 
         # quantize act
-        act_desc = QuantDescriptor(
-            num_bits=act_bits,
-            # unsigned=True
-        )
+        if cw:
+            act_desc = QuantDescriptor(
+                num_bits=act_bits,
+                axis=(0),
+                # unsigned=True
+            )
+        else:
+            act_desc = QuantDescriptor(
+                num_bits=act_bits,
+                # unsigned=True
+            )
         self.act_quant = TensorQuantizer(act_desc)
 
         self.spconv3d = spconv3d
@@ -236,36 +243,18 @@ def q_conv2d(model, module_dict, curr_path='', w_bits=None, act_bits=None):
         return
 
 
-def q_conv3d(model, module_dict, curr_path, w_bits, act_bits):
+def q_conv3d(model, module_dict, curr_path, w_bits, act_bits, cw):
     for name, module in model.named_children():
         # print(module)
         path = f"{curr_path}.{name}" if curr_path else name
-        q_conv3d(module, module_dict, path, w_bits, act_bits)
+        q_conv3d(module, module_dict, path, w_bits, act_bits, cw)
         if isinstance(module, (SubMConv3d, SparseConv3d)) and path != 'backbone_3d.conv_input.0':
             # print(module)
             # replace layer with Pytorch Quantization
-            model._modules[name] = QuantConv3d(spconv3d=module, w_bits=w_bits, act_bits=act_bits)
+            model._modules[name] = QuantConv3d(spconv3d=module, w_bits=w_bits, act_bits=act_bits, cw=cw)
             # replace layer with SQ Quantization (currently unable to perform SQ)
             # model._modules[name] = SQConv3d(spconv3d=module, scaling_factor=0.5)
     return
-
-
-def initialize(calib_method: str, w_bits: int, act_bits: int):
-        """
-        This method is used to initialize the default Descriptor for Conv2d activation quantization:
-            1. intput QuantDescriptor: Max or Histogram
-            2. calib_method -> ["max", "histogram"]
-        :param calib_method: ["max", "histogram"]
-        :return: no return value
-        """
-        quant_desc_input = QuantDescriptor(calib_method=calib_method, num_bits=act_bits, unsigned=True)
-        quant_desc_weight = QuantDescriptor(num_bits=w_bits)
-        quant_nn.QuantConv2d.set_default_quant_desc_input(quant_desc_input)
-        quant_nn.QuantMaxPool2d.set_default_quant_desc_input(quant_desc_input)
-        quant_nn.QuantLinear.set_default_quant_desc_input(quant_desc_input)
-        quant_nn.QuantConv2d.set_default_quant_desc_weight(quant_desc_weight)
-        quant_nn.QuantLinear.set_default_quant_desc_weight(quant_desc_weight)
-        quant_logging.set_verbosity(quant_logging.ERROR)
 
 
 def collect_stats(model, data_loader, n_batches=200):
@@ -300,7 +289,7 @@ def compute_amax(model, device, **kwargs):
 
 
 def dynamic_quant(model, w_bits: int, act_bits: int, sq: bool, alpha: float):
-    q_conv3d(model, module_dict={}, curr_path="", w_bits=w_bits, act_bits=act_bits)
+    q_conv3d(model, module_dict={}, curr_path="", w_bits=w_bits, act_bits=act_bits, cw=sq)
     if sq:
         sq_conv2d(model, module_dict={}, curr_path="", alpha=alpha, w_bits=w_bits, act_bits=act_bits)
     else:
@@ -310,9 +299,7 @@ def dynamic_quant(model, w_bits: int, act_bits: int, sq: bool, alpha: float):
 
 
 def static_quant(model, calib_method: str, w_bits: int, act_bits: int, sq: bool, alpha: float, test_loader, n_batches):
-    initialize(calib_method=calib_method, act_bits=act_bits, w_bits=w_bits)
-
-    q_conv3d(model, module_dict={}, curr_path="", w_bits=w_bits, act_bits=act_bits)
+    q_conv3d(model, module_dict={}, curr_path="", w_bits=w_bits, act_bits=act_bits, cw=sq)
     if sq:
         # SQ
         sq_conv2d(model, module_dict={}, curr_path="", alpha=alpha, w_bits=w_bits, act_bits=act_bits)
