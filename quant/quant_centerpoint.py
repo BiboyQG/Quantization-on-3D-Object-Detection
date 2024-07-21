@@ -110,43 +110,16 @@ class QuantConv3d(SparseModule):
         return x
 
 
-def transfer_test_torch_to_quantization(nn_instance, quant_mudule, w_bits=None, act_bits=None):
-    """
-    This function mainly instanciate the quantized layer,
-    migrate all the attributes of the original layer to the quantized layer,
-    and add the default descriptor to the quantized layer, i.e., how should weight and quantization be quantized.
-    :param nn_instance: original layer
-    :param quant_mudule: corresponding class of the quantized layer
-    :return: no return value
-    """
-    quant_instance = quant_mudule.__new__(quant_mudule)
-    for k, val in vars(nn_instance).items():
-        setattr(quant_instance, k, val)
-
-    def __init__(self):
-        # Return two instances of QuantDescriptor; self.__class__ is the class of quant_instance, E.g.: QuantConv2d
-        # quant_desc_input, quant_desc_weight = quant_nn_utils.pop_quant_desc_in_kwargs(self.__class__)
-        quant_desc_weight = QuantDescriptor(
-            num_bits=w_bits, 
-            axis=(0), 
-        )
-        quant_desc_input = QuantDescriptor(
-            num_bits=act_bits,
-            # unsigned=True
-        )
-        if isinstance(self, quant_nn_utils.QuantInputMixin):
-            self.init_quantizer(quant_desc_input)
-            if isinstance(self._input_quantizer._calibrator, calib.HistogramCalibrator):
-                self._input_quantizer._calibrator._torch_hist = True
-        else:
-            self.init_quantizer(quant_desc_input, quant_desc_weight)
-
-            if isinstance(self._input_quantizer._calibrator, calib.HistogramCalibrator):
-                self._input_quantizer._calibrator._torch_hist = True
-                self._weight_quantizer._calibrator._torch_hist = True
-
-    __init__(quant_instance)
-    return quant_instance
+def q_conv3d(model, module_dict, curr_path, w_bits, act_bits, cw):
+    for name, module in model.named_children():
+        path = f"{curr_path}.{name}" if curr_path else name
+        q_conv3d(module, module_dict, path, w_bits, act_bits, cw)
+        if isinstance(module, (SubMConv3d, SparseConv3d)) and path != 'backbone_3d.conv_input.0':
+            # replace layer with standard quantization
+            model._modules[name] = QuantConv3d(spconv3d=module, w_bits=w_bits, act_bits=act_bits, cw=cw)
+            # replace layer with SQ Quantization (currently unable to perform SQ)
+            # model._modules[name] = SQConv3d(spconv3d=module, scaling_factor=0.5)
+    return
 
 
 def my_transfer_torch_to_quantization(nn_instance, quant_mudule, scaling_factor=None, w_bits=None, act_bits=None):
@@ -204,6 +177,45 @@ def sq_conv2d(model, module_dict, curr_path='', alpha=None, w_bits=None, act_bit
     return
 
 
+def transfer_test_torch_to_quantization(nn_instance, quant_mudule, w_bits=None, act_bits=None):
+    """
+    This function mainly instanciate the quantized layer,
+    migrate all the attributes of the original layer to the quantized layer,
+    and add the default descriptor to the quantized layer, i.e., how should weight and quantization be quantized.
+    :param nn_instance: original layer
+    :param quant_mudule: corresponding class of the quantized layer
+    :return: no return value
+    """
+    quant_instance = quant_mudule.__new__(quant_mudule)
+    for k, val in vars(nn_instance).items():
+        setattr(quant_instance, k, val)
+
+    def __init__(self):
+        # Return two instances of QuantDescriptor; self.__class__ is the class of quant_instance, E.g.: QuantConv2d
+        # quant_desc_input, quant_desc_weight = quant_nn_utils.pop_quant_desc_in_kwargs(self.__class__)
+        quant_desc_weight = QuantDescriptor(
+            num_bits=w_bits, 
+            axis=(0), 
+        )
+        quant_desc_input = QuantDescriptor(
+            num_bits=act_bits,
+            # unsigned=True
+        )
+        if isinstance(self, quant_nn_utils.QuantInputMixin):
+            self.init_quantizer(quant_desc_input)
+            if isinstance(self._input_quantizer._calibrator, calib.HistogramCalibrator):
+                self._input_quantizer._calibrator._torch_hist = True
+        else:
+            self.init_quantizer(quant_desc_input, quant_desc_weight)
+
+            if isinstance(self._input_quantizer._calibrator, calib.HistogramCalibrator):
+                self._input_quantizer._calibrator._torch_hist = True
+                self._weight_quantizer._calibrator._torch_hist = True
+
+    __init__(quant_instance)
+    return quant_instance
+
+
 def q_conv2d(model, module_dict, curr_path='', w_bits=None, act_bits=None):
     if act_bits is None or w_bits is None:
         raise ValueError("Please specify the num_bits parameter!")
@@ -219,18 +231,6 @@ def q_conv2d(model, module_dict, curr_path='', w_bits=None, act_bits=None):
 
         if isinstance(module, (torch.nn.Conv2d)) and path not in no_list:
             model._modules[name] = transfer_test_torch_to_quantization(module, quant_nn.Conv2d, w_bits, act_bits)
-    return
-
-
-def q_conv3d(model, module_dict, curr_path, w_bits, act_bits, cw):
-    for name, module in model.named_children():
-        path = f"{curr_path}.{name}" if curr_path else name
-        q_conv3d(module, module_dict, path, w_bits, act_bits, cw)
-        if isinstance(module, (SubMConv3d, SparseConv3d)) and path != 'backbone_3d.conv_input.0':
-            # replace layer with standard quantization
-            model._modules[name] = QuantConv3d(spconv3d=module, w_bits=w_bits, act_bits=act_bits, cw=cw)
-            # replace layer with SQ Quantization (currently unable to perform SQ)
-            # model._modules[name] = SQConv3d(spconv3d=module, scaling_factor=0.5)
     return
 
 
@@ -324,9 +324,14 @@ def parse_config():
     cfg.TAG = Path(args.cfg_file).stem
     cfg.EXP_GROUP_PATH = '/'.join(args.cfg_file.split('/')[1:-1])  # remove 'cfgs' and 'xxxx.yaml'
 
-    np.random.seed(1024)
-
-    torch.manual_seed(4)
+    # ========== SET SEED ==========
+    seed = 4
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    np.random.seed(seed)
+    # ==============================
 
     if args.set_cfgs is not None:
         cfg_from_list(args.set_cfgs, cfg)
