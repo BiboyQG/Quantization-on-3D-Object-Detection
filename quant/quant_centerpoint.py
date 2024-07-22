@@ -83,7 +83,7 @@ class QuantConv3d(SparseModule):
         if cw:
             act_desc = QuantDescriptor(
                 num_bits=act_bits,
-                axis=(0),
+                axis=(1),
                 # unsigned=True
             )
         else:
