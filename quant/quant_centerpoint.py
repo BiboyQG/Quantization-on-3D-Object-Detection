@@ -402,7 +402,7 @@ def main() -> None:
     model.cuda()
 
     # ========== dynamic ==========
-    dynamic_quant(model, w_bits=8, act_bits=8, sq=False, alpha=0.5)
+    dynamic_quant(model, w_bits=8, act_bits=8, sq=True, alpha=0.5)
     # =============================
 
     # ========== static ==========
