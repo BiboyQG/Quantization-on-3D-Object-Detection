@@ -5,6 +5,7 @@ import os
 import re
 import torch
 from pathlib import Path
+from spconv.pytorch import SparseConvTensor
 from spconv.pytorch.conv import SparseConv3d, SubMConv3d, SubMConv2d
 from spconv.pytorch.modules import SparseModule
 from pytorch_quantization.tensor_quant import QuantDescriptor
@@ -27,41 +28,7 @@ from pcdet.models import load_data_to_gpu
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 no_list = [
-    'dense_head.heads_list.0.center.1',
-    'dense_head.heads_list.0.center_z.1',
-    'dense_head.heads_list.0.dim.1',
-    'dense_head.heads_list.0.rot.1',
-    'dense_head.heads_list.0.vel.1',
-    'dense_head.heads_list.0.hm.0.0',
-    'dense_head.heads_list.0.hm.1',
-    'dense_head.heads_list.1.center.1',
-    'dense_head.heads_list.1.center_z.1',
-    'dense_head.heads_list.1.dim.1',
-    'dense_head.heads_list.1.rot.1',
-    'dense_head.heads_list.1.vel.1',
-    'dense_head.heads_list.1.hm.0.0',
-    'dense_head.heads_list.1.hm.1',
-    'dense_head.heads_list.2.center.1',
-    'dense_head.heads_list.2.dim.1',
-    'dense_head.heads_list.2.rot.1',
-    'dense_head.heads_list.2.vel.1',
-    'dense_head.heads_list.2.hm.0.0',
-    'dense_head.heads_list.2.hm.1',
-    'dense_head.heads_list.3.center.1',
-    'dense_head.heads_list.3.dim.1',
-    'dense_head.heads_list.3.vel.1',
-    'dense_head.heads_list.3.hm.0.0',
-    'dense_head.heads_list.3.hm.1',
-    'dense_head.heads_list.4.center.1',
-    'dense_head.heads_list.4.dim.1',
-    'dense_head.heads_list.4.vel.1',
-    'dense_head.heads_list.4.hm.0.0',
-    'dense_head.heads_list.4.hm.1',
-    'dense_head.heads_list.5.center.1',
-    'dense_head.heads_list.5.dim.1',
-    'dense_head.heads_list.5.vel.1',
-    'dense_head.heads_list.5.hm.0.0',
-    'dense_head.heads_list.5.hm.1'
+    '',
 ]
 
 
@@ -117,9 +84,47 @@ class SQConv2d(SparseModule):
         return
 
     def forward(self, x):
+        # print("orig x", x.features.shape)
         x = x.dense()
-        print(x.shape)
+        # print(x.shape)
         x = self.sqconv2d(x)
+        x = x.permute(0, 2, 3, 1)
+        x = SparseConvTensor.from_dense(x)
+        # print("sparse", x.features.shape)
+        return x
+
+
+class QuantConv2d(SparseModule):
+    def __init__(self, submconv2d, w_bits, act_bits):
+        super().__init__()
+        self.submconv2d = submconv2d
+
+        # quantize w
+        w_desc = QuantDescriptor(
+            num_bits=w_bits,
+            axis=(0)
+        )
+        self.w_quant = TensorQuantizer(w_desc)
+        self.orig_w = self.submconv2d.weight.data.clone()
+
+        # quantize act
+        act_desc = QuantDescriptor(
+            num_bits=act_bits,
+            # unsigned=True
+        )
+        self.act_quant = TensorQuantizer(act_desc)
+        return
+
+    def forward(self, x):
+        oc, kh, kw, ic = self.submconv2d.weight.data.shape
+        w = self.submconv2d.weight.data.permute(0, 3, 1, 2).contiguous().view(oc, -1)
+        w = self.w_quant(w)
+        self.submconv2d.weight.data = w.view(oc, ic, kh, kw).permute(0, 2, 3, 1).contiguous()
+
+        features = x.features
+        features = self.act_quant(features)
+        x = self.submconv2d(x)
+        self.submconv2d.weight.data = self.orig_w.clone()
         return x
 
 
@@ -185,8 +190,9 @@ def sq_conv2d(model, module_dict, curr_path='', alpha=None, w_bits=None, act_bit
         # Recursively process each submodule
         sq_conv2d(module, module_dict, path, alpha, w_bits, act_bits)
 
-        if isinstance(module, (SubMConv2d)) and path not in no_list:
-            model._modules[name] = SQConv2d(sqconv2d=my_transfer_torch_to_quantization(module, MyQuantConv2d, alpha, w_bits, act_bits))
+        if isinstance(module, (SubMConv2d)): #and path not in no_list:
+            sqconv2d = my_transfer_torch_to_quantization(module, MyQuantConv2d, alpha, w_bits, act_bits)
+            model._modules[name] = SQConv2d(sqconv2d=sqconv2d)
     return
 
 
@@ -242,8 +248,8 @@ def q_conv2d(model, module_dict, curr_path='', w_bits=None, act_bits=None):
         # Recursively process each submodule
         q_conv2d(module, module_dict, path, w_bits, act_bits)
 
-        if isinstance(module, (SubMConv2d)) and path not in no_list:
-            model._modules[name] = transfer_test_torch_to_quantization(module, quant_nn.Conv2d, w_bits, act_bits)
+        if isinstance(module, (SubMConv2d)): #and path not in no_list:
+            model._modules[name] = QuantConv2d(submconv2d=module, w_bits=w_bits, act_bits=act_bits)
     return
 
 
@@ -426,10 +432,10 @@ def main() -> None:
 
     print(model)
 
-    # eval_utils.eval_one_epoch(
-    #     cfg, args, model, test_loader, epoch_id, logger, dist_test=dist_test,
-    #     result_dir=eval_output_dir
-    # )
+    eval_utils.eval_one_epoch(
+        cfg, args, model, test_loader, epoch_id, logger, dist_test=dist_test,
+        result_dir=eval_output_dir
+    )
 
     return
 

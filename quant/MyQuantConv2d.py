@@ -24,6 +24,15 @@ class MyQuantConv2d(nn.Module):
             raise ValueError("Please specify the scaling_factor parameter!")
         h_in, w_in = input.shape[2:]
 
+        if isinstance(self.padding, (list)):
+            self.padding = self.padding[0]
+        if isinstance(self.dilation, (list)):
+            self.dilation = self.dilation[0]
+        if isinstance(self.kernel_size, (list)):
+            self.kernel_size = self.kernel_size[0]
+        if isinstance(self.stride, (list)):
+            self.stride = self.stride[0]
+
         h_out = math.floor((h_in + 2*self.padding - self.dilation*(self.kernel_size-1)-1)/self.stride+1)
         w_out = math.floor((w_in + 2*self.padding - self.dilation*(self.kernel_size-1)-1)/self.stride+1)
 
