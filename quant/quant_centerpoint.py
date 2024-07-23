@@ -67,7 +67,7 @@ no_list = [
 
 class QuantConv3d(SparseModule):
     """Pytorch Quantization"""
-    def __init__(self, spconv3d, act_bits, w_bits, cw: bool):
+    def __init__(self, spconv3d, w_bits, act_bits, cw: bool):
         super().__init__()
         self.spconv3d = spconv3d
 
@@ -92,8 +92,6 @@ class QuantConv3d(SparseModule):
                 # unsigned=True
             )
         self.act_quant = TensorQuantizer(act_desc)
-
-        self.spconv3d = spconv3d
         return
 
     def forward(self, x):
@@ -404,7 +402,7 @@ def main() -> None:
     model.cuda()
 
     # ========== dynamic ==========
-    dynamic_quant(model, w_bits=8, act_bits=8, sq=True, alpha=0.5)
+    dynamic_quant(model, w_bits=4, act_bits=8, sq=False, alpha=0.5)
     # =============================
 
     # ========== static ==========
