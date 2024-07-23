@@ -6,7 +6,7 @@ import re
 import torch
 from pathlib import Path
 from spconv.pytorch import SparseConvTensor
-from spconv.pytorch.conv import SparseConv3d, SubMConv3d, SubMConv2d
+from spconv.pytorch.conv import SubMConv3d, SparseConv3d, SubMConv2d, SparseConv2d
 from spconv.pytorch.modules import SparseModule
 from pytorch_quantization.tensor_quant import QuantDescriptor
 from pytorch_quantization.nn.modules.tensor_quantizer import TensorQuantizer
@@ -28,15 +28,56 @@ from pcdet.models import load_data_to_gpu
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 no_list = [
-    '',
+    'dense_head.heads_list.0.center.1',
+    'dense_head.heads_list.0.center_z.1',
+    'dense_head.heads_list.0.dim.1',
+    'dense_head.heads_list.0.rot.1',
+    'dense_head.heads_list.0.vel.1',
+    'dense_head.heads_list.0.hm.0.0',
+    'dense_head.heads_list.0.hm.1',
+    'dense_head.heads_list.1.center.1',
+    'dense_head.heads_list.1.center_z.1',
+    'dense_head.heads_list.1.dim.1',
+    'dense_head.heads_list.1.rot.1',
+    'dense_head.heads_list.1.vel.1',
+    'dense_head.heads_list.1.hm.0.0',
+    'dense_head.heads_list.1.hm.1',
+    'dense_head.heads_list.2.center.1',
+    'dense_head.heads_list.2.center_z.1',
+    'dense_head.heads_list.2.dim.1',
+    'dense_head.heads_list.2.rot.1',
+    'dense_head.heads_list.2.vel.1',
+    'dense_head.heads_list.2.hm.0.0',
+    'dense_head.heads_list.2.hm.1',
+    'dense_head.heads_list.3.center.1',
+    'dense_head.heads_list.3.center_z.1',
+    'dense_head.heads_list.3.dim.1',
+    'dense_head.heads_list.3.rot.1',
+    'dense_head.heads_list.3.vel.1',
+    'dense_head.heads_list.3.hm.0.0',
+    'dense_head.heads_list.3.hm.1',
+    'dense_head.heads_list.4.center.1',
+    'dense_head.heads_list.4.center_z.1',
+    'dense_head.heads_list.4.dim.1',
+    'dense_head.heads_list.4.rot.1',
+    'dense_head.heads_list.4.vel.1',
+    'dense_head.heads_list.4.hm.0.0',
+    'dense_head.heads_list.4.hm.1',
+    'dense_head.heads_list.5.center.1',
+    'dense_head.heads_list.5.center_z.1',
+    'dense_head.heads_list.5.dim.1',
+    'dense_head.heads_list.5.rot.1',
+    'dense_head.heads_list.5.vel.1',
+    'dense_head.heads_list.5.hm.0.0',
+    'dense_head.heads_list.5.hm.1',
 ]
 
 
-class QuantConv3d(SparseModule):
+class QConv3d(SparseModule):
     """Pytorch Quantization"""
-    def __init__(self, spconv3d, w_bits, act_bits, cw: bool):
+    def __init__(self, module, w_bits, act_bits, cw: bool):
         super().__init__()
-        self.spconv3d = spconv3d
+        self.module = module
 
         # quantize w
         w_desc = QuantDescriptor(
@@ -44,7 +85,7 @@ class QuantConv3d(SparseModule):
             axis=(0)
         )
         self.w_quant = TensorQuantizer(w_desc)
-        self.orig_w = self.spconv3d.weight.data.clone()
+        self.orig_w = self.module.weight.data.clone()
 
         # quantize act
         if cw:
@@ -59,21 +100,19 @@ class QuantConv3d(SparseModule):
                 # unsigned=True
             )
         self.act_quant = TensorQuantizer(act_desc)
-
-        self.spconv3d = spconv3d
         return
 
     def forward(self, x):
-        oc, kh, kw, kd, ic = self.spconv3d.weight.data.shape
-        w = self.spconv3d.weight.data.permute(0, 4, 1, 2, 3).contiguous().view(oc, -1)
+        oc, kh, kw, kd, ic = self.module.weight.data.shape
+        w = self.module.weight.data.permute(0, 4, 1, 2, 3).contiguous().view(oc, -1)
         w = self.w_quant(w)
-        self.spconv3d.weight.data = w.view(oc, ic, kh, kw, kd).permute(0, 2, 3, 4, 1).contiguous()
+        self.module.weight.data = w.view(oc, ic, kh, kw, kd).permute(0, 2, 3, 4, 1).contiguous()
 
         features = x.features
         features = self.act_quant(features)
         x = x.replace_feature(features)
-        x = self.spconv3d(x)
-        self.spconv3d.weight.data = self.orig_w.clone()
+        x = self.module(x)
+        self.module.weight.data = self.orig_w.clone()
         return x
 
 
@@ -94,10 +133,10 @@ class SQConv2d(SparseModule):
         return x
 
 
-class QuantConv2d(SparseModule):
-    def __init__(self, submconv2d, w_bits, act_bits):
+class QConv2d(SparseModule):
+    def __init__(self, module, w_bits, act_bits):
         super().__init__()
-        self.submconv2d = submconv2d
+        self.module = module
 
         # quantize w
         w_desc = QuantDescriptor(
@@ -105,7 +144,7 @@ class QuantConv2d(SparseModule):
             axis=(0)
         )
         self.w_quant = TensorQuantizer(w_desc)
-        self.orig_w = self.submconv2d.weight.data.clone()
+        self.orig_w = self.module.weight.data.clone()
 
         # quantize act
         act_desc = QuantDescriptor(
@@ -116,15 +155,15 @@ class QuantConv2d(SparseModule):
         return
 
     def forward(self, x):
-        oc, kh, kw, ic = self.submconv2d.weight.data.shape
-        w = self.submconv2d.weight.data.permute(0, 3, 1, 2).contiguous().view(oc, -1)
+        oc, kh, kw, ic = self.module.weight.data.shape
+        w = self.module.weight.data.permute(0, 3, 1, 2).contiguous().view(oc, -1)
         w = self.w_quant(w)
-        self.submconv2d.weight.data = w.view(oc, ic, kh, kw).permute(0, 2, 3, 1).contiguous()
+        self.module.weight.data = w.view(oc, ic, kh, kw).permute(0, 2, 3, 1).contiguous()
 
         features = x.features
         features = self.act_quant(features)
-        x = self.submconv2d(x)
-        self.submconv2d.weight.data = self.orig_w.clone()
+        x = self.module(x)
+        self.module.weight.data = self.orig_w.clone()
         return x
 
 
@@ -134,9 +173,9 @@ def q_conv3d(model, module_dict, curr_path, w_bits, act_bits, cw):
         q_conv3d(module, module_dict, path, w_bits, act_bits, cw)
         if isinstance(module, (SubMConv3d, SparseConv3d)) and path != 'backbone_3d.conv_input.0':
             # replace layer with standard quantization
-            model._modules[name] = QuantConv3d(spconv3d=module, w_bits=w_bits, act_bits=act_bits, cw=cw)
+            model._modules[name] = QConv3d(module=module, w_bits=w_bits, act_bits=act_bits, cw=cw)
             # replace layer with SQ Quantization (currently unable to perform SQ)
-            # model._modules[name] = SQConv3d(spconv3d=module, scaling_factor=0.5)
+            # model._modules[name] = SQConv3d(module=module, scaling_factor=0.5)
     return
 
 
@@ -190,13 +229,13 @@ def sq_conv2d(model, module_dict, curr_path='', alpha=None, w_bits=None, act_bit
         # Recursively process each submodule
         sq_conv2d(module, module_dict, path, alpha, w_bits, act_bits)
 
-        if isinstance(module, (SubMConv2d)): #and path not in no_list:
+        if isinstance(module, (SubMConv2d, SparseConv2d)) and path not in no_list:
             sqconv2d = my_transfer_torch_to_quantization(module, MyQuantConv2d, alpha, w_bits, act_bits)
             model._modules[name] = SQConv2d(sqconv2d=sqconv2d)
     return
 
 
-def transfer_test_torch_to_quantization(nn_instance, quant_mudule, w_bits=None, act_bits=None):
+def transfer_torch_to_quantization(nn_instance, quant_mudule, w_bits=None, act_bits=None):
     """
     This function mainly instanciate the quantized layer,
     migrate all the attributes of the original layer to the quantized layer,
@@ -248,8 +287,8 @@ def q_conv2d(model, module_dict, curr_path='', w_bits=None, act_bits=None):
         # Recursively process each submodule
         q_conv2d(module, module_dict, path, w_bits, act_bits)
 
-        if isinstance(module, (SubMConv2d)): #and path not in no_list:
-            model._modules[name] = QuantConv2d(submconv2d=module, w_bits=w_bits, act_bits=act_bits)
+        if isinstance(module, (SubMConv2d, SparseConv2d)) and path not in no_list:
+            model._modules[name] = QConv2d(module=module, w_bits=w_bits, act_bits=act_bits)
     return
 
 
