@@ -65,11 +65,11 @@ no_list = [
 ]
 
 
-class QuantConv3d(SparseModule):
+class QConv3d(SparseModule):
     """Pytorch Quantization"""
-    def __init__(self, spconv3d, w_bits, act_bits, cw: bool):
+    def __init__(self, module, w_bits: int, act_bits: int, cw: bool):
         super().__init__()
-        self.spconv3d = spconv3d
+        self.module = module
 
         # quantize w
         w_desc = QuantDescriptor(
@@ -77,7 +77,7 @@ class QuantConv3d(SparseModule):
             axis=(0)
         )
         self.w_quant = TensorQuantizer(w_desc)
-        self.orig_w = self.spconv3d.weight.data.clone()
+        self.orig_w = self.module.weight.data.clone()
 
         # quantize act
         if cw:
@@ -95,16 +95,16 @@ class QuantConv3d(SparseModule):
         return
 
     def forward(self, x):
-        oc, kh, kw, kd, ic = self.spconv3d.weight.data.shape
-        w = self.spconv3d.weight.data.permute(0, 4, 1, 2, 3).contiguous().view(oc, -1)
+        oc, kh, kw, kd, ic = self.module.weight.data.shape
+        w = self.module.weight.data.permute(0, 4, 1, 2, 3).contiguous().view(oc, -1)
         w = self.w_quant(w)
-        self.spconv3d.weight.data = w.view(oc, ic, kh, kw, kd).permute(0, 2, 3, 4, 1).contiguous()
+        self.module.weight.data = w.view(oc, ic, kh, kw, kd).permute(0, 2, 3, 4, 1).contiguous()
 
         features = x.features
         features = self.act_quant(features)
         x = x.replace_feature(features)
-        x = self.spconv3d(x)
-        self.spconv3d.weight.data = self.orig_w.clone()
+        x = self.module(x)
+        self.module.weight.data = self.orig_w.clone()
         return x
 
 
@@ -114,9 +114,9 @@ def q_conv3d(model, module_dict, curr_path, w_bits, act_bits, cw):
         q_conv3d(module, module_dict, path, w_bits, act_bits, cw)
         if isinstance(module, (SubMConv3d, SparseConv3d)) and path != 'backbone_3d.conv_input.0':
             # replace layer with standard quantization
-            model._modules[name] = QuantConv3d(spconv3d=module, w_bits=w_bits, act_bits=act_bits, cw=cw)
+            model._modules[name] = QConv3d(module=module, w_bits=w_bits, act_bits=act_bits, cw=cw)
             # replace layer with SQ Quantization (currently unable to perform SQ)
-            # model._modules[name] = SQConv3d(spconv3d=module, scaling_factor=0.5)
+            # model._modules[name] = SQConv3d(module=module, scaling_factor=0.5)
     return
 
 
@@ -175,7 +175,7 @@ def sq_conv2d(model, module_dict, curr_path='', alpha=None, w_bits=None, act_bit
     return
 
 
-def transfer_test_torch_to_quantization(nn_instance, quant_mudule, w_bits=None, act_bits=None):
+def transfer_torch_to_quantization(nn_instance, quant_mudule, w_bits=None, act_bits=None):
     """
     This function mainly instanciate the quantized layer,
     migrate all the attributes of the original layer to the quantized layer,
@@ -228,7 +228,7 @@ def q_conv2d(model, module_dict, curr_path='', w_bits=None, act_bits=None):
         q_conv2d(module, module_dict, path, w_bits, act_bits)
 
         if isinstance(module, (torch.nn.Conv2d)) and path not in no_list:
-            model._modules[name] = transfer_test_torch_to_quantization(module, quant_nn.Conv2d, w_bits, act_bits)
+            model._modules[name] = transfer_torch_to_quantization(module, quant_nn.Conv2d, w_bits, act_bits)
     return
 
 
