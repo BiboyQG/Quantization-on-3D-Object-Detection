@@ -14,7 +14,6 @@ from pytorch_quantization import nn as quant_nn
 from pytorch_quantization.nn.modules import _utils as quant_nn_utils
 from pytorch_quantization import calib
 from tqdm import tqdm
-from MyQuantConv2d import MyQuantConv2d
 
 from tools.eval_utils import eval_utils
 from pcdet.datasets import build_dataloader
@@ -117,18 +116,21 @@ class QConv3d(SparseModule):
 
 
 class SQConv2d(SparseModule):
-    def __init__(self, sqconv2d):
+    def __init__(self, sqsubm2d, subm2d):
         super().__init__()
-        self.sqconv2d = sqconv2d
+        self.sqsubm2d = sqsubm2d
+        self.subm2d = subm2d
+        self.sqsubm2d.weight.data = self.subm2d.weight.data.permute(0, 3, 1, 2).contiguous()
         return
 
     def forward(self, x):
         # print("orig x", x.features.shape)
         x = x.dense()
-        # print(x.shape)
-        x = self.sqconv2d(x)
-        x = x.permute(0, 2, 3, 1)
+        w, x = self.sqsubm2d(x)
+        self.subm2d.weight.data = w
         x = SparseConvTensor.from_dense(x)
+        x = self.subm2d(x)
+        # x = SparseConvTensor.from_dense(x)
         # print("sparse", x.features.shape)
         return x
 
@@ -230,8 +232,8 @@ def sq_conv2d(model, module_dict, curr_path='', alpha=None, w_bits=None, act_bit
         sq_conv2d(module, module_dict, path, alpha, w_bits, act_bits)
 
         if isinstance(module, (SubMConv2d, SparseConv2d)) and path not in no_list:
-            sqconv2d = my_transfer_torch_to_quantization(module, MyQuantConv2d, alpha, w_bits, act_bits)
-            model._modules[name] = SQConv2d(sqconv2d=sqconv2d)
+            sqsubm2d = my_transfer_torch_to_quantization(module, SQSubM2d, alpha, w_bits, act_bits)
+            model._modules[name] = SQConv2d(sqsubm2d = sqsubm2d, subm2d = module)
     return
 
 
@@ -469,7 +471,11 @@ def main() -> None:
     # static_quant(model, calib_method="max", w_bits=8, act_bits=8, sq=True, alpha=0.5, test_loader=test_loader, n_batches=200)
     # ============================
 
-    print(model)
+    logger.info(model)
+
+    # for name, module in model.named_modules():
+    #     if isinstance(module, SubMConv2d):
+    #         print(f'module name: {name}\t', module.indice_key)
 
     eval_utils.eval_one_epoch(
         cfg, args, model, test_loader, epoch_id, logger, dist_test=dist_test,
