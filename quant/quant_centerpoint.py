@@ -4,23 +4,23 @@ import numpy as np
 import os
 import re
 import torch
-from pathlib import Path
-from spconv.pytorch.conv import SubMConv3d, SparseConv3d
-from spconv.pytorch.modules import SparseModule
-from pytorch_quantization.tensor_quant import QuantDescriptor
-from pytorch_quantization.nn.modules.tensor_quantizer import TensorQuantizer
-from pytorch_quantization import nn as quant_nn
-from pytorch_quantization.nn.modules import _utils as quant_nn_utils
-from pytorch_quantization import calib
-from tqdm import tqdm
 from MyQuantConv2d import MyQuantConv2d
-
-from tools.eval_utils import eval_utils
+from pathlib import Path
+from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_file
 from pcdet.datasets import build_dataloader
 from pcdet.models import build_network
-from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_file
-from pcdet.utils import common_utils
 from pcdet.models import load_data_to_gpu
+from pcdet.utils import common_utils
+from pytorch_quantization import calib
+from pytorch_quantization import nn as quant_nn
+from pytorch_quantization.nn.modules.tensor_quantizer import TensorQuantizer
+from pytorch_quantization.nn.modules import _utils as quant_nn_utils
+from pytorch_quantization.tensor_quant import QuantDescriptor
+from QConv3d import QConv3d
+from spconv.pytorch.conv import SubMConv3d, SparseConv3d
+from tools.eval_utils import eval_utils
+from tqdm import tqdm
+
 
 # sh scripts/dist_test.sh 3 --cfg_file cfgs/nuscenes_models/cbgs_voxel0075_res3d_centerpoint.yaml --ckpt ../weights/cbgs_voxel0075_centerpoint_nds_6648.pth
 
@@ -42,70 +42,34 @@ no_list = [
     'dense_head.heads_list.1.hm.0.0',
     'dense_head.heads_list.1.hm.1',
     'dense_head.heads_list.2.center.1',
+    'dense_head.heads_list.2.center_z.1',
     'dense_head.heads_list.2.dim.1',
     'dense_head.heads_list.2.rot.1',
     'dense_head.heads_list.2.vel.1',
     'dense_head.heads_list.2.hm.0.0',
     'dense_head.heads_list.2.hm.1',
     'dense_head.heads_list.3.center.1',
+    'dense_head.heads_list.3.center_z.1',
     'dense_head.heads_list.3.dim.1',
+    'dense_head.heads_list.3.rot.1',
     'dense_head.heads_list.3.vel.1',
     'dense_head.heads_list.3.hm.0.0',
     'dense_head.heads_list.3.hm.1',
     'dense_head.heads_list.4.center.1',
+    'dense_head.heads_list.4.center_z.1',
     'dense_head.heads_list.4.dim.1',
+    'dense_head.heads_list.4.rot.1',
     'dense_head.heads_list.4.vel.1',
     'dense_head.heads_list.4.hm.0.0',
     'dense_head.heads_list.4.hm.1',
     'dense_head.heads_list.5.center.1',
+    'dense_head.heads_list.5.center_z.1',
     'dense_head.heads_list.5.dim.1',
+    'dense_head.heads_list.5.rot.1',
     'dense_head.heads_list.5.vel.1',
     'dense_head.heads_list.5.hm.0.0',
     'dense_head.heads_list.5.hm.1'
 ]
-
-
-class QConv3d(SparseModule):
-    """Pytorch Quantization"""
-    def __init__(self, module, w_bits: int, act_bits: int, cw: bool):
-        super().__init__()
-        self.module = module
-
-        # quantize w
-        w_desc = QuantDescriptor(
-            num_bits=w_bits,
-            axis=(0)
-        )
-        self.w_quant = TensorQuantizer(w_desc)
-        self.orig_w = self.module.weight.data.clone()
-
-        # quantize act
-        if cw:
-            act_desc = QuantDescriptor(
-                num_bits=act_bits,
-                axis=(1),
-                # unsigned=True
-            )
-        else:
-            act_desc = QuantDescriptor(
-                num_bits=act_bits,
-                # unsigned=True
-            )
-        self.act_quant = TensorQuantizer(act_desc)
-        return
-
-    def forward(self, x):
-        oc, kh, kw, kd, ic = self.module.weight.data.shape
-        w = self.module.weight.data.permute(0, 4, 1, 2, 3).contiguous().view(oc, -1)
-        w = self.w_quant(w)
-        self.module.weight.data = w.view(oc, ic, kh, kw, kd).permute(0, 2, 3, 4, 1).contiguous()
-
-        features = x.features
-        features = self.act_quant(features)
-        x = x.replace_feature(features)
-        x = self.module(x)
-        self.module.weight.data = self.orig_w.clone()
-        return x
 
 
 def q_conv3d(model, module_dict, curr_path, w_bits, act_bits, cw):
@@ -275,7 +239,7 @@ def dynamic_quant(model, w_bits: int, act_bits: int, sq: bool, alpha: float):
     return
 
 
-def static_quant(model, calib_method: str, w_bits: int, act_bits: int, sq: bool, alpha: float, test_loader, n_batches):
+def static_quant(model, w_bits: int, act_bits: int, sq: bool, alpha: float, test_loader, n_batches):
     q_conv3d(model, module_dict={}, curr_path="", w_bits=w_bits, act_bits=act_bits, cw=sq)
     if sq:
         # SQ
@@ -406,10 +370,10 @@ def main() -> None:
     # =============================
 
     # ========== static ==========
-    # static_quant(model, calib_method="max", w_bits=8, act_bits=8, sq=True, alpha=0.5, test_loader=test_loader, n_batches=200)
+    # static_quant(model, w_bits=8, act_bits=8, sq=True, alpha=0.5, test_loader=test_loader, n_batches=200)
     # ============================
 
-    print(model)
+    logger.info(model)
 
     eval_utils.eval_one_epoch(
         cfg, args, model, test_loader, epoch_id, logger, dist_test=dist_test,

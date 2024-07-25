@@ -1,5 +1,5 @@
-import torch
 import math
+import torch
 import torch.nn as nn
 from torch.nn.parameter import Parameter
 
@@ -18,6 +18,9 @@ class MyQuantConv2d(nn.Module):
         self.scaling_factor = scaling_factor
 
         self.weight = Parameter(torch.Tensor(out_channels, in_channels, kernel_size, kernel_size)).to(device)
+        self.bias = Parameter(torch.Tensor(out_channels)).to(device)
+
+        return
 
     def forward(self, input):
         if self.scaling_factor is None:
@@ -70,4 +73,9 @@ class MyQuantConv2d(nn.Module):
         x = x.reshape(bs, num_sliding, self.out_channels)
         x = torch.transpose(x, 1, 2)
         x = x.reshape(bs, self.out_channels, h_out, w_out)
+
+        if self.bias is not None:
+            b = self.bias.view(1, self.out_channels, 1, 1)
+            x += b
+
         return x
