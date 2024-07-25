@@ -5,7 +5,7 @@ import os
 import re
 import torch
 from pathlib import Path
-from spconv.pytorch.conv import SparseConv3d, SubMConv3d
+from spconv.pytorch.conv import SubMConv3d, SparseConv3d
 from spconv.pytorch.modules import SparseModule
 from pytorch_quantization.tensor_quant import QuantDescriptor
 from pytorch_quantization.nn.modules.tensor_quantizer import TensorQuantizer
