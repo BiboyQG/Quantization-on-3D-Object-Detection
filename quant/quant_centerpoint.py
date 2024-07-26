@@ -16,7 +16,7 @@ from pytorch_quantization import nn as quant_nn
 from pytorch_quantization.nn.modules.tensor_quantizer import TensorQuantizer
 from pytorch_quantization.nn.modules import _utils as quant_nn_utils
 from pytorch_quantization.tensor_quant import QuantDescriptor
-from QConv3d import QConv3d
+from QConvNd import QConvNd
 from spconv.pytorch.conv import SubMConv3d, SparseConv3d
 from tools.eval_utils import eval_utils
 from tqdm import tqdm
@@ -78,7 +78,7 @@ def q_conv3d(model, module_dict, curr_path, w_bits, act_bits, cw):
         q_conv3d(module, module_dict, path, w_bits, act_bits, cw)
         if isinstance(module, (SubMConv3d, SparseConv3d)) and path != 'backbone_3d.conv_input.0':
             # replace layer with standard quantization
-            model._modules[name] = QConv3d(module=module, w_bits=w_bits, act_bits=act_bits, cw=cw)
+            model._modules[name] = QConvNd(module=module, w_bits=w_bits, act_bits=act_bits, cw=cw)
             # replace layer with SQ Quantization (currently unable to perform SQ)
             # model._modules[name] = SQConv3d(module=module, scaling_factor=0.5)
     return

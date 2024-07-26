@@ -3,8 +3,8 @@ from pytorch_quantization.tensor_quant import QuantDescriptor
 from spconv.pytorch.modules import SparseModule
 
 
-class QConv3d(SparseModule):
-    """Pytorch Quantization"""
+class QConvNd(SparseModule):
+    """Quant Module for SubMConvNd & SparseConvNd"""
     def __init__(self, module, w_bits: int, act_bits: int, cw: bool):
         super().__init__()
         self.module = module
@@ -34,10 +34,16 @@ class QConv3d(SparseModule):
         return
 
     def forward(self, x):
-        oc, kh, kw, kd, ic = self.module.weight.data.shape
-        self.module.weight.data = self.module.weight.data.permute(0, 4, 1, 2, 3).contiguous().view(oc, -1)
+        oc = self.module.weight.data.shape[0]
+        ic = self.module.weight.data.shape[-1]
+        kdim = self.module.weight.data.shape[1:-1]
+        dim = self.module.weight.data.dim()
+        permute_dim = [0, dim-1] + list(range(1, dim-1))
+        self.module.weight.data = self.module.weight.data.permute(permute_dim).contiguous().view(oc, -1)
         self.module.weight.data = self.w_quant(self.module.weight.data)
-        self.module.weight.data = self.module.weight.data.view(oc, ic, kh, kw, kd).permute(0, 2, 3, 4, 1).contiguous()
+        permute_dim = [0] + list(range(2, dim)) + [1]
+        shape = (oc, ic) + tuple(kdim)
+        self.module.weight.data = self.module.weight.data.view(shape).permute(permute_dim).contiguous()
 
         features = x.features
         features = self.act_quant(features)
