@@ -17,7 +17,7 @@ from pytorch_quantization.nn.modules.tensor_quantizer import TensorQuantizer
 from pytorch_quantization.nn.modules import _utils as quant_nn_utils
 from pytorch_quantization.tensor_quant import QuantDescriptor
 from QConvNd import QConvNd
-from smoothquant import SQConv2d
+from smoothquant import SQConv2d, SQConv1d, SQLinear
 from spconv.pytorch.conv import SubMConv3d, SparseConv3d
 from tools.eval_utils import eval_utils
 from tqdm import tqdm
@@ -28,48 +28,50 @@ from tqdm import tqdm
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 no_list = [
-    'dense_head.heads_list.0.center.1',
-    'dense_head.heads_list.0.center_z.1',
-    'dense_head.heads_list.0.dim.1',
-    'dense_head.heads_list.0.rot.1',
-    'dense_head.heads_list.0.vel.1',
-    'dense_head.heads_list.0.hm.0.0',
-    'dense_head.heads_list.0.hm.1',
-    'dense_head.heads_list.1.center.1',
-    'dense_head.heads_list.1.center_z.1',
-    'dense_head.heads_list.1.dim.1',
-    'dense_head.heads_list.1.rot.1',
-    'dense_head.heads_list.1.vel.1',
-    'dense_head.heads_list.1.hm.0.0',
-    'dense_head.heads_list.1.hm.1',
-    'dense_head.heads_list.2.center.1',
-    'dense_head.heads_list.2.center_z.1',
-    'dense_head.heads_list.2.dim.1',
-    'dense_head.heads_list.2.rot.1',
-    'dense_head.heads_list.2.vel.1',
-    'dense_head.heads_list.2.hm.0.0',
-    'dense_head.heads_list.2.hm.1',
-    'dense_head.heads_list.3.center.1',
-    'dense_head.heads_list.3.center_z.1',
-    'dense_head.heads_list.3.dim.1',
-    'dense_head.heads_list.3.rot.1',
-    'dense_head.heads_list.3.vel.1',
-    'dense_head.heads_list.3.hm.0.0',
-    'dense_head.heads_list.3.hm.1',
-    'dense_head.heads_list.4.center.1',
-    'dense_head.heads_list.4.center_z.1',
-    'dense_head.heads_list.4.dim.1',
-    'dense_head.heads_list.4.rot.1',
-    'dense_head.heads_list.4.vel.1',
-    'dense_head.heads_list.4.hm.0.0',
-    'dense_head.heads_list.4.hm.1',
-    'dense_head.heads_list.5.center.1',
-    'dense_head.heads_list.5.center_z.1',
-    'dense_head.heads_list.5.dim.1',
-    'dense_head.heads_list.5.rot.1',
-    'dense_head.heads_list.5.vel.1',
-    'dense_head.heads_list.5.hm.0.0',
-    'dense_head.heads_list.5.hm.1'
+    'dense_head.decoder.self_attn.out_proj',
+    'dense_head.decoder.multihead_attn.out_proj',
+    # 'dense_head.heads_list.0.center.1',
+    # 'dense_head.heads_list.0.center_z.1',
+    # 'dense_head.heads_list.0.dim.1',
+    # 'dense_head.heads_list.0.rot.1',
+    # 'dense_head.heads_list.0.vel.1',
+    # 'dense_head.heads_list.0.hm.0.0',
+    # 'dense_head.heads_list.0.hm.1',
+    # 'dense_head.heads_list.1.center.1',
+    # 'dense_head.heads_list.1.center_z.1',
+    # 'dense_head.heads_list.1.dim.1',
+    # 'dense_head.heads_list.1.rot.1',
+    # 'dense_head.heads_list.1.vel.1',
+    # 'dense_head.heads_list.1.hm.0.0',
+    # 'dense_head.heads_list.1.hm.1',
+    # 'dense_head.heads_list.2.center.1',
+    # 'dense_head.heads_list.2.center_z.1',
+    # 'dense_head.heads_list.2.dim.1',
+    # 'dense_head.heads_list.2.rot.1',
+    # 'dense_head.heads_list.2.vel.1',
+    # 'dense_head.heads_list.2.hm.0.0',
+    # 'dense_head.heads_list.2.hm.1',
+    # 'dense_head.heads_list.3.center.1',
+    # 'dense_head.heads_list.3.center_z.1',
+    # 'dense_head.heads_list.3.dim.1',
+    # 'dense_head.heads_list.3.rot.1',
+    # 'dense_head.heads_list.3.vel.1',
+    # 'dense_head.heads_list.3.hm.0.0',
+    # 'dense_head.heads_list.3.hm.1',
+    # 'dense_head.heads_list.4.center.1',
+    # 'dense_head.heads_list.4.center_z.1',
+    # 'dense_head.heads_list.4.dim.1',
+    # 'dense_head.heads_list.4.rot.1',
+    # 'dense_head.heads_list.4.vel.1',
+    # 'dense_head.heads_list.4.hm.0.0',
+    # 'dense_head.heads_list.4.hm.1',
+    # 'dense_head.heads_list.5.center.1',
+    # 'dense_head.heads_list.5.center_z.1',
+    # 'dense_head.heads_list.5.dim.1',
+    # 'dense_head.heads_list.5.rot.1',
+    # 'dense_head.heads_list.5.vel.1',
+    # 'dense_head.heads_list.5.hm.0.0',
+    # 'dense_head.heads_list.5.hm.1'
 ]
 
 
@@ -273,6 +275,26 @@ def dynamic_quant(
             src=(nn.Conv2d),
             tgt=SQConv2d,
         )
+        smoothquant(
+            model,
+            module_dict={},
+            curr_path="",
+            alpha=alpha,
+            w_bits=w_bits,
+            act_bits=act_bits,
+            src=(nn.Conv1d),
+            tgt=SQConv1d,
+        )
+        smoothquant(
+            model,
+            module_dict={},
+            curr_path="",
+            alpha=alpha,
+            w_bits=w_bits,
+            act_bits=act_bits,
+            src=(nn.Linear),
+            tgt=SQLinear,
+        )
     else:
         pytorch_quant(
             model,
@@ -282,6 +304,24 @@ def dynamic_quant(
             act_bits=act_bits,
             src=(nn.Conv2d),
             tgt=quant_nn.Conv2d,
+        )
+        pytorch_quant(
+            model,
+            module_dict={},
+            curr_path="",
+            w_bits=w_bits,
+            act_bits=act_bits,
+            src=(nn.Conv1d),
+            tgt=quant_nn.Conv1d,
+        )
+        pytorch_quant(
+            model,
+            module_dict={},
+            curr_path="",
+            w_bits=w_bits,
+            act_bits=act_bits,
+            src=(nn.Linear),
+            tgt=quant_nn.Linear,
         )
 
     return
@@ -315,6 +355,26 @@ def static_quant(
             src=(nn.Conv2d),
             tgt=SQConv2d,
         )
+        smoothquant(
+            model,
+            module_dict={},
+            curr_path="",
+            alpha=alpha,
+            w_bits=w_bits,
+            act_bits=act_bits,
+            src=(nn.Conv1d),
+            tgt=SQConv1d,
+        )
+        smoothquant(
+            model,
+            module_dict={},
+            curr_path="",
+            alpha=alpha,
+            w_bits=w_bits,
+            act_bits=act_bits,
+            src=(nn.Linear),
+            tgt=SQLinear,
+        )
     else:
         pytorch_quant(
             model,
@@ -324,6 +384,24 @@ def static_quant(
             act_bits=act_bits,
             src=(nn.Conv2d),
             tgt=quant_nn.Conv2d,
+        )
+        pytorch_quant(
+            model,
+            module_dict={},
+            curr_path="",
+            w_bits=w_bits,
+            act_bits=act_bits,
+            src=(nn.Conv1d),
+            tgt=quant_nn.Conv1d,
+        )
+        pytorch_quant(
+            model,
+            module_dict={},
+            curr_path="",
+            w_bits=w_bits,
+            act_bits=act_bits,
+            src=(nn.Linear),
+            tgt=quant_nn.Linear,
         )
 
     collect_stats(model, test_loader, n_batches)
@@ -362,7 +440,8 @@ def parse_config():
     # NEED THIS I DONNO WHY
     # args.local_rank = int(os.environ['LOCAL_RANK'])
     cfg.TAG = Path(args.cfg_file).stem
-    cfg.EXP_GROUP_PATH = '/'.join(args.cfg_file.split('/')[1:-1])  # remove 'cfgs' and 'xxxx.yaml'
+    # remove 'cfgs' and 'xxxx.yaml'
+    cfg.EXP_GROUP_PATH = '/'.join(args.cfg_file.split('/')[1:-1])
 
     # ========== SET SEED ==========
     seed = 4
@@ -453,7 +532,7 @@ def main() -> None:
     model.cuda()
 
     # ========== dynamic ==========
-    dynamic_quant(model, w_bits=8, act_bits=8, sq=True, alpha=0.5)
+    # dynamic_quant(model, w_bits=8, act_bits=8, sq=True, alpha=0.5)
     # =============================
 
     # ========== static ==========
