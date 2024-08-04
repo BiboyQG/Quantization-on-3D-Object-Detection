@@ -30,48 +30,6 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 no_list = [
     'dense_head.decoder.self_attn.out_proj',
     'dense_head.decoder.multihead_attn.out_proj',
-    # 'dense_head.heads_list.0.center.1',
-    # 'dense_head.heads_list.0.center_z.1',
-    # 'dense_head.heads_list.0.dim.1',
-    # 'dense_head.heads_list.0.rot.1',
-    # 'dense_head.heads_list.0.vel.1',
-    # 'dense_head.heads_list.0.hm.0.0',
-    # 'dense_head.heads_list.0.hm.1',
-    # 'dense_head.heads_list.1.center.1',
-    # 'dense_head.heads_list.1.center_z.1',
-    # 'dense_head.heads_list.1.dim.1',
-    # 'dense_head.heads_list.1.rot.1',
-    # 'dense_head.heads_list.1.vel.1',
-    # 'dense_head.heads_list.1.hm.0.0',
-    # 'dense_head.heads_list.1.hm.1',
-    # 'dense_head.heads_list.2.center.1',
-    # 'dense_head.heads_list.2.center_z.1',
-    # 'dense_head.heads_list.2.dim.1',
-    # 'dense_head.heads_list.2.rot.1',
-    # 'dense_head.heads_list.2.vel.1',
-    # 'dense_head.heads_list.2.hm.0.0',
-    # 'dense_head.heads_list.2.hm.1',
-    # 'dense_head.heads_list.3.center.1',
-    # 'dense_head.heads_list.3.center_z.1',
-    # 'dense_head.heads_list.3.dim.1',
-    # 'dense_head.heads_list.3.rot.1',
-    # 'dense_head.heads_list.3.vel.1',
-    # 'dense_head.heads_list.3.hm.0.0',
-    # 'dense_head.heads_list.3.hm.1',
-    # 'dense_head.heads_list.4.center.1',
-    # 'dense_head.heads_list.4.center_z.1',
-    # 'dense_head.heads_list.4.dim.1',
-    # 'dense_head.heads_list.4.rot.1',
-    # 'dense_head.heads_list.4.vel.1',
-    # 'dense_head.heads_list.4.hm.0.0',
-    # 'dense_head.heads_list.4.hm.1',
-    # 'dense_head.heads_list.5.center.1',
-    # 'dense_head.heads_list.5.center_z.1',
-    # 'dense_head.heads_list.5.dim.1',
-    # 'dense_head.heads_list.5.rot.1',
-    # 'dense_head.heads_list.5.vel.1',
-    # 'dense_head.heads_list.5.hm.0.0',
-    # 'dense_head.heads_list.5.hm.1'
 ]
 
 
@@ -532,7 +490,7 @@ def main() -> None:
     model.cuda()
 
     # ========== dynamic ==========
-    # dynamic_quant(model, w_bits=8, act_bits=8, sq=True, alpha=0.5)
+    dynamic_quant(model, w_bits=8, act_bits=8, sq=True, alpha=0.5)
     # =============================
 
     # ========== static ==========
