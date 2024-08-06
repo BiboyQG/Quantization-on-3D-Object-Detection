@@ -30,6 +30,13 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 no_list = [
     'dense_head.decoder.self_attn.out_proj',
     'dense_head.decoder.multihead_attn.out_proj',
+    'dense_head.heatmap_head.1',
+    'dense_head.prediction_head.center.1',
+    'dense_head.prediction_head.height.1',
+    'dense_head.prediction_head.dim.1',
+    'dense_head.prediction_head.rot.1',
+    'dense_head.prediction_head.vel.1',
+    'dense_head.prediction_head.heatmap.1',
 ]
 
 
