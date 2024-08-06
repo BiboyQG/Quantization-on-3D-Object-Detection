@@ -295,6 +295,9 @@ class SQLinear(nn.Module):
         return
 
     def forward(self, x):
+        _, bs, _ = x.shape
+        # [seq_len bs ic] -> [seq_len*bs ic]
+        x = x.view(-1, self.in_features)
         w_tensor = self.weight.abs().detach()
         x_tensor = x.abs().detach()
 
@@ -313,5 +316,7 @@ class SQLinear(nn.Module):
 
         if self.bias is not None:
             x += self.bias.view(1, self.out_features)
+
+        x = x.view(-1, bs, self.out_features)
 
         return x
